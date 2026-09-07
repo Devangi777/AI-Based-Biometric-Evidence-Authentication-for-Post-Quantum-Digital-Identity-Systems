@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.venv_test/
+
+# Environment / secrets
+.env
+
+# Datasets (never commit real research datasets)
+datasets/*
+!datasets/.gitkeep
+!datasets/download_*.py
+!datasets/download_samples.md
+
+# Model weights / checkpoints
+*.pth
+*.pt
+*.onnx
+*.h5
+*.ckpt
+checkpoints/
+weights/
+detection/weights/
+
+# Demo assets that are large binary captures (keep the README, ignore actual
+# video/image samples so the repo stays small - teammates generate/drop their
+# own locally per demo_assets/README-assets.md)
+demo_assets/attacks/*.jpg
+demo_assets/attacks/*.jpeg
+demo_assets/attacks/*.png
+demo_assets/attacks/*.mp4
+demo_assets/attacks/*.mov
+!demo_assets/attacks/.gitkeep
+
+# Evaluation outputs
+evaluation/results/
+evaluation/*.csv
+evaluation/*.png
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

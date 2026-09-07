@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pq-biometric-auth-server:latest
+    container_name: pq-biometric-auth-server
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Live-reload friendly during development; comment out for a frozen
+      # image in CI/demo-day.
+      - ./crypto:/app/crypto
+      - ./detection:/app/detection
+      - ./binding:/app/binding
+      - ./server:/app/server
+      - ./evaluation:/app/evaluation
+      - ./demo_assets:/app/demo_assets
+    command: ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

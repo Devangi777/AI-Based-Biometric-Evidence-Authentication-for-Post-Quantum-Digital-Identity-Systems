@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# Server-side dependencies (crypto/, detection/, binding/, server/, evaluation/)
+#
+# IMPORTANT (Windows): liboqs-python requires building the native liboqs C
+# library via cmake/ninja/a C compiler on first import. There is no prebuilt
+# wheel for the C library itself. On native Windows this build step commonly
+# fails unless Visual Studio Build Tools + CMake + Ninja are installed.
+#
+# Per SETUP.md / README.md Section "Windows Setup Strategy", this file is
+# intended to be installed INSIDE the Docker Linux container (see
+# docker-compose.yml, Dockerfile), where the build toolchain is provisioned
+# automatically and liboqs compiles cleanly. If you have already verified
+# `pip install liboqs-python && python -c "import oqs"` works natively on
+# your machine, you may install this file natively instead - see SETUP.md
+# Section 1 ("try the pip wheel first").
+#
+# The Streamlit demo client (client_demo/) is intentionally NOT in this file;
+# it runs natively on Windows and uses requirements-client.txt instead.
+# ---------------------------------------------------------------------------
+
+# --- Web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.5
+pydantic-settings==2.7.1
+python-multipart==0.0.20
+websockets==14.1
+
+# --- Post-quantum cryptography (Section 5) ---
+liboqs-python==0.16.0
+cryptography==44.0.0
+
+# --- AI / ML (Section 6) ---
+torch==2.5.1
+torchvision==0.20.1
+opencv-python-headless==4.10.0.84
+mediapipe==0.10.18
+numpy==1.26.4
+pillow==11.1.0
+imagehash==4.3.1
+
+# --- Evaluation (Section 8) ---
+scikit-learn==1.6.1
+psutil==6.1.1
+pandas==2.2.3
+matplotlib==3.10.0
+locust==2.32.6
+
+# --- Utilities ---
+python-dotenv==1.0.1
+httpx==0.28.1
+
+# --- Tests ---
+pytest==8.3.4
+pytest-asyncio==0.25.2

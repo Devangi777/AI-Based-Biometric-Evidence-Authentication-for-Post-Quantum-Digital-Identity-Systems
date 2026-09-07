@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# Client-demo dependencies (client_demo/streamlit_app.py only).
+#
+# Runs NATIVELY on Windows Python (not in Docker) because webcam access via
+# streamlit-webrtc is simplest directly on the host OS. This process talks to
+# the Dockerized FastAPI server over HTTP at API_BASE_URL (see .env.example).
+# It does NOT need liboqs-python - all PQC operations happen server-side in
+# this prototype (see README.md "Assumptions" for why).
+#
+# Install into a native Windows venv:
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements-client.txt
+# ---------------------------------------------------------------------------
+
+streamlit==1.41.1
+streamlit-webrtc==0.47.9
+av==13.1.0
+opencv-python-headless==4.10.0.84
+pillow==11.1.0
+numpy==1.26.4
+requests==2.32.3
+python-dotenv==1.0.1
+pandas==2.2.3
