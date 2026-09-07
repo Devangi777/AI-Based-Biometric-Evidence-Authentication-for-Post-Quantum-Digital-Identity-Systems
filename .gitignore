@@ -28,8 +28,8 @@ datasets/*
 *.h5
 *.ckpt
 checkpoints/
-weights/
-detection/weights/
+detection/weights/*
+!detection/weights/.gitkeep
 
 # Demo assets that are large binary captures (keep the README, ignore actual
 # video/image samples so the repo stays small - teammates generate/drop their
