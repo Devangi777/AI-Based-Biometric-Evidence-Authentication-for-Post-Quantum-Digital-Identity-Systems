@@ -1,11 +1,7 @@
-"""FastAPI server: session lifecycle, crypto (ML-KEM/ML-DSA), and Section 7
-transaction-binding enforcement (nonce single-use, timestamp freshness,
-signature validity, challenge fulfilment placeholder).
-
-No AI detection yet - detection/*.py and the fusion engine add the AI
-attack-detection pipeline in front of the final ACCEPT/REJECT decision in a
-later stage, and will supply the real challenge-fulfilment check that
-binding/session_binding.py currently stubs out.
+"""FastAPI server: session lifecycle, crypto (ML-KEM/ML-DSA), Section 7
+transaction-binding enforcement, and the AI attack-detection + fusion
+pipeline (spec Section 3's full server-side flow: KEM decap -> DSA verify ->
+AI detection pipeline -> decision engine).
 
 See README.md "Assumptions" #2 for why both the "client" ML-DSA signer and
 the "server" ML-DSA verifier live in this one process: the Streamlit demo
@@ -14,19 +10,58 @@ exposes distinct client-role and server-role endpoints instead.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
+import logging
 import time
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from binding.session_binding import check_transaction_binding
 from crypto.kem import client_encapsulate, derive_channel_key, kem_details
 from crypto.signature import build_binding_payload, sig_details
+from detection.deepfake_detector import DeepfakeDetector
+from detection.fusion import fuse
+from detection.injection_detector import InjectionDetector
+from detection.liveness_challenge import verify_challenge
+from detection.morph_detector import MorphDetector
+from detection.presentation_attack import PresentationAttackDetector
+from detection.replay_detector import store as replay_store
 from server.config import settings
 from server.session_store import Session, nonce_b64, store
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="PQ-Biometric-Auth Server", version="0.1.0")
+
+# Process-wide detector instances (spec Section 6: pretrained-first, with an
+# automatic mock-mode fallback logged per-module if a checkpoint/dependency
+# is unavailable - see detection/README-models.md). Instantiated once at
+# import time rather than per-request since loading a real checkpoint would
+# be too slow to redo on every submission.
+_pad_detector = PresentationAttackDetector(mode=settings.detection_mode, device=settings.detector_device)
+_morph_detector = MorphDetector(mode=settings.detection_mode, device=settings.detector_device)
+_deepfake_detector = DeepfakeDetector(mode=settings.detection_mode, device=settings.detector_device)
+_injection_detector = InjectionDetector(mode=settings.detection_mode, device=settings.detector_device)
+
+_FUSION_WEIGHTS = {
+    "presentation_attack": settings.weight_presentation_attack,
+    "morph": settings.weight_morph,
+    "deepfake": settings.weight_deepfake,
+    "replay": settings.weight_replay,
+    "injection": settings.weight_injection,
+}
+_FUSION_THRESHOLDS = {
+    "presentation_attack": settings.threshold_presentation_attack,
+    "morph": settings.threshold_morph,
+    "deepfake": settings.threshold_deepfake,
+    "replay": settings.threshold_replay,
+    "injection": settings.threshold_injection,
+}
 
 
 # --------------------------------------------------------------------------
@@ -70,13 +105,27 @@ class VerifyRequest(BaseModel):
     timestamp: str
     challenge_response: str = ""
     signature: str = Field(description="hex-encoded ML-DSA signature to verify")
+    frames_b64: list[str] = Field(
+        default_factory=list,
+        description="base64-encoded JPEG/PNG frames in temporal order; required only if binding checks pass",
+    )
+    frame_timestamps: list[float] | None = Field(
+        default=None, description="unix timestamps per frame, for the injection detector's timing heuristic"
+    )
 
 
 class VerifyResponse(BaseModel):
     session_id: str
-    accepted: bool = Field(description="True only if ALL Section 7 step-6 checks pass")
-    checks: dict[str, bool]
-    reasons: list[str]
+    binding_accepted: bool = Field(description="True only if ALL Section 7 step-6 checks pass")
+    binding_checks: dict[str, bool]
+    binding_reasons: list[str]
+    detection_ran: bool = Field(description="False if rejected at the binding stage, before AI detection runs")
+    detection_scores: dict[str, float] | None = None
+    detection_is_mock: dict[str, bool] | None = None
+    fused_score: float | None = None
+    below_threshold_modules: list[str] | None = None
+    accepted: bool = Field(description="Final ACCEPT/REJECT decision")
+    reason: str
     timing_ms: dict[str, float]
 
 
@@ -88,6 +137,18 @@ def _get_session_or_404(session_id: str) -> Session:
     if session is None:
         raise HTTPException(status_code=404, detail=f"Unknown session_id {session_id!r}")
     return session
+
+
+def _decode_frames(frames_b64: list[str]) -> list[np.ndarray]:
+    frames = []
+    for i, b64 in enumerate(frames_b64):
+        try:
+            raw = base64.b64decode(b64)
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+            frames.append(np.array(image))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"could not decode frames_b64[{i}]: {exc}") from exc
+    return frames
 
 
 # --------------------------------------------------------------------------
@@ -183,12 +244,12 @@ def sign_evidence(session_id: str, req: EvidenceSignRequest) -> EvidenceSignResp
 
 @app.post("/session/{session_id}/verify", response_model=VerifyResponse)
 def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
-    """Full Section 7 step-6 transaction-binding check: ML-DSA signature
-    validity, nonce single-use, timestamp freshness, and (placeholder until
-    detection/fusion.py exists) challenge fulfilment. Does NOT run the AI
-    attack-detection pipeline yet (added in a later stage) - a session
-    passing every check here is only eligible to proceed to that pipeline,
-    per Section 7 step 7."""
+    """Full spec Section 3 server-side pipeline: Section 7 step-6 transaction
+    binding (signature, nonce single-use, timestamp freshness, challenge
+    fulfilment) - only if ALL of those pass does the submission proceed to
+    the AI attack-detection pipeline (5 detectors) and the fusion decision
+    engine, per Section 7 step 7 ("Only if all four checks pass does the
+    evidence proceed to the AI attack-detection pipeline")."""
     session = _get_session_or_404(session_id)
 
     try:
@@ -197,8 +258,10 @@ def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="evidence_hash and signature must be hex-encoded") from exc
 
+    frames = _decode_frames(req.frames_b64)
+
     t0 = time.perf_counter()
-    result = check_transaction_binding(
+    binding_result = check_transaction_binding(
         session_nonce=session.nonce,
         session_challenge=session.challenge,
         client_public_key=session.client_signer.public_key,
@@ -209,6 +272,7 @@ def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
         signature=signature,
         nonce_already_used=session.nonce_used,
         freshness_window_seconds=settings.freshness_window_seconds,
+        challenge_check=lambda challenge, response: verify_challenge(challenge, response, frames),
     )
     t1 = time.perf_counter()
 
@@ -217,12 +281,69 @@ def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
     # nonce (spec Section 7: "prevents replay ... nonce ... unique").
     session.nonce_used = True
 
+    timing_ms = {"binding_check_ms": (t1 - t0) * 1000}
+
+    if not binding_result.accepted:
+        logger.info("session=%s binding_rejected reasons=%s", session_id, binding_result.reasons)
+        return VerifyResponse(
+            session_id=session_id,
+            binding_accepted=False,
+            binding_checks=binding_result.checks,
+            binding_reasons=binding_result.reasons,
+            detection_ran=False,
+            accepted=False,
+            reason="rejected at transaction-binding stage: " + "; ".join(binding_result.reasons),
+            timing_ms=timing_ms,
+        )
+
+    if not frames:
+        raise HTTPException(status_code=400, detail="frames_b64 must contain at least one frame once binding checks pass")
+
+    t2 = time.perf_counter()
+    primary_frame = frames[0]
+    detection_results = [
+        _pad_detector.predict(primary_frame),
+        _morph_detector.predict(primary_frame),
+        _deepfake_detector.predict_video(frames),
+        replay_store.check_and_record(primary_frame, session_id=session_id),
+        _injection_detector.predict(primary_frame, frame_timestamps=req.frame_timestamps),
+    ]
+    t3 = time.perf_counter()
+
+    fusion_result = fuse(
+        detection_results,
+        weights=_FUSION_WEIGHTS,
+        per_module_thresholds=_FUSION_THRESHOLDS,
+        accept_threshold=settings.fusion_accept_threshold,
+    )
+    t4 = time.perf_counter()
+
+    timing_ms["detection_ms"] = (t3 - t2) * 1000
+    timing_ms["fusion_ms"] = (t4 - t3) * 1000
+    timing_ms["total_ms"] = sum(timing_ms.values())
+
+    if fusion_result.accepted:
+        reason = f"accepted (fused_score={fusion_result.fused_score:.2f} >= threshold={fusion_result.threshold})"
+    else:
+        reason = (
+            f"rejected by fusion (fused_score={fusion_result.fused_score:.2f}, threshold={fusion_result.threshold}, "
+            f"below_threshold_modules={fusion_result.below_threshold_modules})"
+        )
+    logger.info("session=%s decision=%s fused_score=%.3f", session_id, fusion_result.accepted, fusion_result.fused_score)
+
     return VerifyResponse(
         session_id=session_id,
-        accepted=result.accepted,
-        checks=result.checks,
-        reasons=result.reasons,
-        timing_ms={"binding_check_ms": (t1 - t0) * 1000},
+        binding_accepted=True,
+        binding_checks=binding_result.checks,
+        binding_reasons=[],
+        detection_ran=True,
+        detection_scores=fusion_result.per_module_scores,
+        detection_is_mock=fusion_result.per_module_is_mock,
+        fused_score=fusion_result.fused_score,
+        below_threshold_modules=fusion_result.below_threshold_modules,
+        accepted=fusion_result.accepted,
+        reason=reason,
+        timing_ms=timing_ms,
     )
 
 
