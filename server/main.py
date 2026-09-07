@@ -1,8 +1,11 @@
-"""FastAPI server: session lifecycle + crypto-only evidence signing/verification.
+"""FastAPI server: session lifecycle, crypto (ML-KEM/ML-DSA), and Section 7
+transaction-binding enforcement (nonce single-use, timestamp freshness,
+signature validity, challenge fulfilment placeholder).
 
-No AI detection yet (added in later stages: binding/session_binding.py wires
-in full nonce/freshness/challenge enforcement; detection/*.py + the fusion
-engine add the AI attack-detection pipeline in front of the final decision).
+No AI detection yet - detection/*.py and the fusion engine add the AI
+attack-detection pipeline in front of the final ACCEPT/REJECT decision in a
+later stage, and will supply the real challenge-fulfilment check that
+binding/session_binding.py currently stubs out.
 
 See README.md "Assumptions" #2 for why both the "client" ML-DSA signer and
 the "server" ML-DSA verifier live in this one process: the Streamlit demo
@@ -17,8 +20,9 @@ import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from binding.session_binding import check_transaction_binding
 from crypto.kem import client_encapsulate, derive_channel_key, kem_details
-from crypto.signature import build_binding_payload, sig_details, verify as sig_verify
+from crypto.signature import build_binding_payload, sig_details
 from server.config import settings
 from server.session_store import Session, nonce_b64, store
 
@@ -70,8 +74,9 @@ class VerifyRequest(BaseModel):
 
 class VerifyResponse(BaseModel):
     session_id: str
-    signature_valid: bool
-    reason: str
+    accepted: bool = Field(description="True only if ALL Section 7 step-6 checks pass")
+    checks: dict[str, bool]
+    reasons: list[str]
     timing_ms: dict[str, float]
 
 
@@ -162,7 +167,7 @@ def sign_evidence(session_id: str, req: EvidenceSignRequest) -> EvidenceSignResp
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="evidence_hash must be hex-encoded") from exc
 
-    payload = build_binding_payload(evidence_hash, session_id, req.timestamp, req.challenge_response)
+    payload = build_binding_payload(evidence_hash, session.nonce, req.timestamp, req.challenge_response)
 
     t0 = time.perf_counter()
     signature = session.client_signer.sign(payload)
@@ -178,9 +183,12 @@ def sign_evidence(session_id: str, req: EvidenceSignRequest) -> EvidenceSignResp
 
 @app.post("/session/{session_id}/verify", response_model=VerifyResponse)
 def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
-    """Crypto-only verification (signature validity). Nonce single-use,
-    timestamp freshness window, and challenge-fulfilment checks are added in
-    binding/session_binding.py and wired in here in a later stage."""
+    """Full Section 7 step-6 transaction-binding check: ML-DSA signature
+    validity, nonce single-use, timestamp freshness, and (placeholder until
+    detection/fusion.py exists) challenge fulfilment. Does NOT run the AI
+    attack-detection pipeline yet (added in a later stage) - a session
+    passing every check here is only eligible to proceed to that pipeline,
+    per Section 7 step 7."""
     session = _get_session_or_404(session_id)
 
     try:
@@ -189,17 +197,32 @@ def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="evidence_hash and signature must be hex-encoded") from exc
 
-    payload = build_binding_payload(evidence_hash, session_id, req.timestamp, req.challenge_response)
-
     t0 = time.perf_counter()
-    valid = sig_verify(payload, signature, session.client_signer.public_key, alg=settings.sig_alg)
+    result = check_transaction_binding(
+        session_nonce=session.nonce,
+        session_challenge=session.challenge,
+        client_public_key=session.client_signer.public_key,
+        sig_alg=settings.sig_alg,
+        evidence_hash=evidence_hash,
+        timestamp=req.timestamp,
+        challenge_response=req.challenge_response,
+        signature=signature,
+        nonce_already_used=session.nonce_used,
+        freshness_window_seconds=settings.freshness_window_seconds,
+    )
     t1 = time.perf_counter()
+
+    # The nonce is single-use: this verify attempt consumes it regardless of
+    # outcome, so a rejected submission can't be retried against the same
+    # nonce (spec Section 7: "prevents replay ... nonce ... unique").
+    session.nonce_used = True
 
     return VerifyResponse(
         session_id=session_id,
-        signature_valid=valid,
-        reason="ML-DSA signature valid" if valid else "ML-DSA signature verification failed",
-        timing_ms={"verify_ms": (t1 - t0) * 1000},
+        accepted=result.accepted,
+        checks=result.checks,
+        reasons=result.reasons,
+        timing_ms={"binding_check_ms": (t1 - t0) * 1000},
     )
 
 

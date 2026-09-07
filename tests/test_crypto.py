@@ -64,7 +64,7 @@ class TestMlDsa:
         from crypto.signature import SignerIdentity, verify
 
         with SignerIdentity(alg="ML-DSA-65") as signer:
-            message = build_binding_payload(b"\x00" * 32, "session-123", "2026-09-07T00:00:00Z", "7")
+            message = build_binding_payload(b"\x00" * 32, b"nonce-bytes-123", "2026-09-07T00:00:00Z", "7")
             signature = signer.sign(message)
             assert verify(message, signature, signer.public_key, alg="ML-DSA-65") is True
 
@@ -72,7 +72,7 @@ class TestMlDsa:
         from crypto.signature import SignerIdentity, verify
 
         with SignerIdentity(alg="ML-DSA-65") as signer:
-            message = build_binding_payload(b"\x00" * 32, "session-123", "2026-09-07T00:00:00Z", "7")
+            message = build_binding_payload(b"\x00" * 32, b"nonce-bytes-123", "2026-09-07T00:00:00Z", "7")
             signature = signer.sign(message)
             tampered_message = message[:-1] + b"\x01"
             assert verify(tampered_message, signature, signer.public_key, alg="ML-DSA-65") is False
@@ -81,7 +81,7 @@ class TestMlDsa:
         from crypto.signature import SignerIdentity, verify
 
         with SignerIdentity(alg="ML-DSA-65") as signer_a, SignerIdentity(alg="ML-DSA-65") as signer_b:
-            message = build_binding_payload(b"\x00" * 32, "session-123", "2026-09-07T00:00:00Z", "7")
+            message = build_binding_payload(b"\x00" * 32, b"nonce-bytes-123", "2026-09-07T00:00:00Z", "7")
             signature = signer_a.sign(message)
             assert verify(message, signature, signer_b.public_key, alg="ML-DSA-65") is False
 
@@ -93,8 +93,8 @@ class TestMlDsa:
 
 
 def test_build_binding_payload_is_concatenation_in_order():
-    payload = build_binding_payload(b"HASH", "sess-1", "ts-1", "chal-1")
-    assert payload == b"HASHsess-1ts-1chal-1"
+    payload = build_binding_payload(b"HASH", b"NONCE", "ts-1", "chal-1")
+    assert payload == b"HASHNONCEts-1chal-1"
 
 
 class TestClassicalBaseline:

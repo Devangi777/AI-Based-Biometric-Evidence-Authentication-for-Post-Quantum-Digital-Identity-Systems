@@ -62,18 +62,24 @@ def verify(message: bytes, signature: bytes, public_key: bytes, alg: str = DEFAU
 
 def build_binding_payload(
     evidence_hash: bytes,
-    session_id: str,
+    session_nonce: bytes,
     timestamp: str,
     challenge_response: str = "",
 ) -> bytes:
     """Serialize the Section 7 binding payload:
-    evidence_hash || session_nonce (session_id) || timestamp || challenge_response
+    evidence_hash || session_nonce || timestamp || challenge_response
+
+    `session_nonce` is the random single-use nonce the server issued at
+    session start (server/session_store.py Session.nonce) - NOT the
+    session_id/UUID used to look the session up over HTTP. Using the actual
+    nonce here (rather than the session_id) is what session/binding.py's
+    single-use enforcement is protecting.
 
     Note: Section 5.2's illustrative snippet omits challenge_response; Section
     7's full binding design (the mechanism actually implemented in
     binding/session_binding.py) includes it, so that is what this builds.
     """
-    return evidence_hash + session_id.encode("utf-8") + timestamp.encode("utf-8") + challenge_response.encode("utf-8")
+    return evidence_hash + session_nonce + timestamp.encode("utf-8") + challenge_response.encode("utf-8")
 
 
 def sig_details(alg: str = DEFAULT_SIG_ALG) -> dict:
