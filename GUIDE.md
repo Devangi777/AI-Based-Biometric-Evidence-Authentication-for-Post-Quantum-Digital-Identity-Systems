@@ -55,14 +55,18 @@ Figures are in `report/figures/` (`fig_q*`).
 
 ```bash
 cd AI-Based-Biometric-Evidence-Authentication-for-Post-Quantum-Digital-Identity-Systems
-source .venv/bin/activate
 
-# terminal 1: the server
-uvicorn server.main:app --port 8000
-
-# terminal 2: the dashboard (opens http://localhost:8501)
-streamlit run client_demo/streamlit_app.py
+./scripts/run_server.sh        # terminal 1: the server on :8000
+./scripts/run_client.sh        # terminal 2: the dashboard, opens http://localhost:8501
 ```
+
+These scripts always use the project's `.venv`, so they work even if you
+forgot to activate it. **Don't type plain `uvicorn ...`** unless `.venv` is
+active: otherwise your Mac runs a different Python (3.13) that doesn't have
+the project's packages and fails with `ModuleNotFoundError: No module named
+'imagehash'`. Worse, its reload supervisor can stay alive holding port 8000
+and block the next start. If that happens: `lsof -iTCP:8000 -sTCP:LISTEN`
+shows the PID; `kill <PID>`.
 
 Your `.env` has `DEMO_MODE=true`, which enables the **Reset replay memory**
 button. The server takes 10–30 s to start, while MediaPipe loads; wait for
@@ -253,7 +257,9 @@ Grover **0.96 → 0.43** at 1% gate error.
 | Live capture rejected: **morph** | A strong repeating pattern behind your face (stripes, blinds); use a plain background. |
 | No **Record** button | Press **START** on the video box and allow the camera. In System Settings → Privacy & Security → Camera, allow your browser. |
 | Video box never connects | Use the **"Camera stream won't connect? Use two photos instead"** fallback just below it. |
-| Sidebar: *Server unreachable* | Start the server; give it up to 30 s. |
+| Sidebar: *Server unreachable* | Start the server with `./scripts/run_server.sh`; give it up to 30 s. |
+| `ModuleNotFoundError: No module named ...` when starting | You ran plain `uvicorn` outside `.venv` (wrong Python). Use `./scripts/run_server.sh`. |
+| `address already in use` on port 8000 | A leftover server holds it: `lsof -iTCP:8000 -sTCP:LISTEN`, then `kill <PID>`; or `docker compose down` if it's the container. |
 | Sidebar: *Client channel: plaintext* | Run Streamlit from the project `.venv` (it has liboqs). |
 | Genuine sample rejected as replay | It was already used; **Reset replay memory**. |
 | "Refused" on Reset | `DEMO_MODE=true` in `.env`, then restart the server (Docker: `--force-recreate`). |
@@ -266,8 +272,8 @@ Grover **0.96 → 0.43** at 1% gate error.
 
 ```bash
 source .venv/bin/activate
-uvicorn server.main:app --port 8000                 # server
-streamlit run client_demo/streamlit_app.py          # dashboard
+./scripts/run_server.sh                             # server (always uses .venv)
+./scripts/run_client.sh                             # dashboard
 python scripts/demo_check.py --explain              # 12-scenario self-check with reasons
 python scripts/make_demo_assets.py                  # rebuild attack samples
 pytest tests/ -q                                    # 105 tests

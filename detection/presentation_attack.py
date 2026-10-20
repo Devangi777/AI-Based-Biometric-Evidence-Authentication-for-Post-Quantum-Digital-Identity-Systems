@@ -74,10 +74,10 @@ class PresentationAttackDetector:
 
     def _try_load_model(self):
         try:
-            import torch  # noqa: F401 - availability check
-
+            # Check for weights first: importing torch is slow, and pointless with no checkpoint.
             if not WEIGHTS_PATH.exists():
                 raise FileNotFoundError(f"{WEIGHTS_PATH} not found - see detection/README-models.md")
+            import torch  # noqa: F401 - availability check
             raise FileNotFoundError(
                 "MiniFASNet architecture is not vendored in this repo (only the checkpoint path is "
                 "wired up) - see detection/README-models.md for what to add"

@@ -56,10 +56,10 @@ class InjectionDetector:
 
     def _try_load_model(self):
         try:
-            import torch  # noqa: F401
-
+            # Check for weights first: importing torch is slow, and pointless with no checkpoint.
             if not WEIGHTS_PATH.exists():
                 raise FileNotFoundError(f"{WEIGHTS_PATH} not found - see detection/README-models.md")
+            import torch  # noqa: F401
             raise FileNotFoundError("Injection CNN architecture is not vendored in this repo yet")
         except Exception as exc:
             logger.warning("Injection: pretrained CNN unavailable (%s); using heuristic-only scoring.", exc)

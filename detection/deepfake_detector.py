@@ -87,10 +87,10 @@ class DeepfakeDetector:
 
     def _try_load_model(self):
         try:
-            import torch
-
+            # Check for weights first: importing torch is slow, and pointless with no checkpoint.
             if not WEIGHTS_PATH.exists():
                 raise FileNotFoundError(f"{WEIGHTS_PATH} not found - see detection/README-models.md")
+            import torch
             model = _build_meso4()
             state_dict = torch.load(WEIGHTS_PATH, map_location=self.device)
             model.load_state_dict(state_dict)

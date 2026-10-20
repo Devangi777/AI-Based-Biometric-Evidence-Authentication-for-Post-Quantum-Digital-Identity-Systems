@@ -179,7 +179,7 @@ need `docker compose up --build`.
 | `Cannot connect to the Docker daemon` | Open Docker Desktop and wait until it is running |
 | Container *unhealthy*, logs show `input/output error` | Your Mac's disk is (nearly) full and Docker's VM can't write. Free space, then quit and reopen Docker Desktop |
 | Build fails or hangs at the liboqs/cmake step | Docker Desktop → Settings → Resources: more CPU/memory, then `docker compose up --build` |
-| `port is already allocated` on 8000 | Something else owns port 8000 (often a native `uvicorn`): stop it, or `docker compose down` |
+| `port is already allocated` on 8000 | Something else owns port 8000 (often a native `uvicorn`): find it with `lsof -iTCP:8000 -sTCP:LISTEN` and `kill` it, or `docker compose down` |
 | `curl: (7) Failed to connect` right after starting | Still starting; wait for `Application startup complete` |
 | Dashboard says *Server unreachable* | Check `curl http://localhost:8000/health`; `API_BASE_URL` in `.env` must be `http://localhost:8000` |
 
@@ -191,9 +191,12 @@ python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -r requirements-client.txt
 cp .env.example .env
 
-uvicorn server.main:app --port 8000          # terminal 1
-streamlit run client_demo/streamlit_app.py   # terminal 2
+./scripts/run_server.sh                       # terminal 1: server on :8000
+./scripts/run_client.sh                      # terminal 2: dashboard on :8501
 ```
+
+The scripts always use the project's `.venv`. Running plain `uvicorn` outside
+the activated venv uses a different Python and fails with `ModuleNotFoundError`.
 
 Full walkthrough: [`docs/SETUP_MACOS.md`](docs/SETUP_MACOS.md).
 
