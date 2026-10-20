@@ -1,7 +1,7 @@
 """Shared test fixtures/markers.
 
 `oqs` (liboqs-python) needs a working native liboqs build, which reliably
-fails on native Windows without cmake/ninja/a C toolchain (see SETUP.md).
+fails on native Windows without cmake/ninja/a C toolchain (see docs/SETUP.md).
 Rather than importing at collection time and hard-failing the whole test
 session outside Docker, we probe once here and expose `HAS_OQS` so
 PQC-dependent test modules can `pytestmark = skip_if_no_oqs`. This is a test
@@ -25,7 +25,7 @@ skip_if_no_oqs = pytest.mark.skipif(
     not HAS_OQS,
     reason=(
         "liboqs native library unavailable in this environment "
-        f"({_OQS_IMPORT_ERROR!r}). Run inside Docker per SETUP.md, or "
+        f"({_OQS_IMPORT_ERROR!r}). Run inside Docker per docs/SETUP.md, or "
         "install a native build toolchain (cmake/ninja/VS Build Tools)."
     ),
 )

@@ -1,0 +1,5 @@
+module,is_mock,accuracy,precision,recall,f1,apcer,bpcer,n_genuine,n_attack,threshold
+presentation_attack,True,1.0,1.0,1.0,1.0,0.0,0.0,8,8,0.5
+morph,True,0.5,0.5,1.0,0.6666666666666666,1.0,0.0,8,8,0.5
+deepfake,True,0.5,0.5,1.0,0.6666666666666666,1.0,0.0,8,8,0.5
+injection,True,0.5,0.5,1.0,0.6666666666666666,1.0,0.0,8,8,0.5

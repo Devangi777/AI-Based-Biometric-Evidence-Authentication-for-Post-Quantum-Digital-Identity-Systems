@@ -1,244 +1,398 @@
 """Streamlit demo client - spec Section 12.
 
-Runs NATIVELY on Windows Python (see SETUP.md - webcam access via
-streamlit-webrtc is simplest directly on the host OS) and talks to the
-Dockerized FastAPI server (server/main.py) over HTTP at API_BASE_URL. All
-PQC operations happen server-side (README.md "Assumptions" #2); this app
-only computes the SHA-256 evidence hash locally and orchestrates API calls.
+Talks to the FastAPI server (server/main.py) at API_BASE_URL. Three tabs:
+  - Live Capture: a real person on the laptop camera. The browser streams
+    the camera over WebRTC (streamlit-webrtc) and a 4-second clip is
+    recorded while the person performs the session's liveness challenge
+    (client_demo/recorder.py). Expected outcome: ACCEPT. A two-photo
+    fallback (st.camera_input) is available if WebRTC can't connect.
+  - Simulate Attack: a pre-made sample from demo_assets/attacks/ (or an
+    upload) through the identical pipeline. Expected outcome: REJECT, with
+    the detector that caught it.
+  - Tamper with Protocol: a genuine capture, but with the transaction
+    binding or the sealed channel broken on purpose. Expected outcome:
+    REJECT before any AI runs.
 
-Implements both Section 12 demo modes as tabs:
-  - Live Capture: real webcam via streamlit-webrtc, full session + liveness
-    challenge + verification flow against a live frame.
-  - Simulate Attack: loads a bundled file from demo_assets/attacks/ (or an
-    uploaded file) and feeds it through the identical pipeline, so the
-    audience sees the same crypto+binding+detection flow catch each attack
-    type rather than a separate "fake" code path.
+When liboqs is available on this machine the client encapsulates against the
+session's ML-KEM public key itself and sends the evidence sealed with
+AES-256-GCM (/verify-sealed); otherwise it falls back to plaintext /verify
+and says so in the sidebar.
 """
 from __future__ import annotations
 
+import sys
 import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
+from PIL import Image
 
-from client_demo.api_client import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # `streamlit run` doesn't add the repo root
+
+from client_demo.api_client import (  # noqa: E402
+    TAMPER_MODES,
     ApiError,
-    establish_channel,
+    can_seal,
     health,
-    now_iso,
+    reset_replay_store,
+    run_verification,
     session_start,
-    sha256_hex,
-    sign_evidence,
-    verify_evidence,
 )
-from client_demo.frame_utils import frame_to_b64, frame_to_png_bytes, load_attack_file
+from client_demo.frame_utils import load_attack_file, quality_check  # noqa: E402
+from client_demo.recorder import LOOK_STRAIGHT_SECONDS, RECORD_SECONDS, ClipRecorder, sample_frames  # noqa: E402
 
 load_dotenv()
 
-st.set_page_config(page_title="PQ-Biometric-Auth Demo", layout="wide")
+st.set_page_config(page_title="PQ Biometric Evidence Authentication", layout="wide")
 
-ATTACK_FILES = {
+ATTACKS_DIR = Path(__file__).resolve().parent.parent / "demo_assets" / "attacks"
+SAMPLES = {
+    "Genuine sample (bona fide control)": "genuine_sample.jpg",
+    "Replay (resubmitted genuine capture)": "replay_sample.jpg",
     "Presentation attack (printed photo)": "presentation_photo.jpg",
     "Presentation attack (screen replay)": "presentation_screen_replay.mp4",
     "Face morphing": "morphed_face.jpg",
     "Deepfake": "deepfake_sample.mp4",
-    "Replay (resubmitted genuine capture)": "replay_sample.jpg",
     "Injection (virtual camera / screen recording)": "injection_sample.mp4",
 }
-
-ATTACKS_DIR = Path(__file__).resolve().parent.parent / "demo_assets" / "attacks"
+MODULE_LABELS = {
+    "presentation_attack": "Presentation attack (PAD)",
+    "morph": "Face morph",
+    "deepfake": "Deepfake",
+    "replay": "Replay (pHash)",
+    "injection": "Injection",
+}
+CHECK_LABELS = {
+    "channel_authentic": "Sealed payload decrypts and authenticates (ML-KEM + AES-256-GCM)",
+    "signature_valid": "ML-DSA-65 signature over hash ‖ nonce ‖ timestamp ‖ response",
+    "nonce_unused": "Session nonce not used before",
+    "timestamp_fresh": "Timestamp within the 30 s freshness window",
+    "challenge_fulfilled": "Liveness challenge fulfilled",
+    "evidence_matches_hash": "Submitted frames match the signed evidence hash",
+}
+MODULE_THRESHOLD = 0.5
+FUSION_THRESHOLD = 0.6
 
 
 def _init_state() -> None:
     st.session_state.setdefault("log", [])
-    st.session_state.setdefault("session", None)
-    st.session_state.setdefault("captured_frame", None)
+    st.session_state.setdefault("live_session", None)
+    st.session_state.setdefault("live_clip", None)
 
 
-def _sidebar_health() -> None:
-    st.sidebar.header("Server status")
+def _sidebar() -> None:
+    st.sidebar.header("System status")
     try:
         info = health()
     except ApiError as exc:
         st.sidebar.error(f"Server unreachable: {exc}")
-        st.sidebar.caption("Check docker compose is running - see SETUP.md.")
+        st.sidebar.caption("Start it with `uvicorn server.main:app --port 8000` (see GUIDE.md).")
         return
-
     if info.get("liboqs_ready"):
-        st.sidebar.success(f"Server reachable\n\n{info['kem_alg']} / {info['sig_alg']}")
+        st.sidebar.success(f"Server online\n\n{info['kem_alg']} / {info['sig_alg']}")
     else:
-        st.sidebar.warning(f"Server reachable, but liboqs not ready:\n\n{info.get('error', 'unknown error')}")
+        st.sidebar.warning(f"Server online, but liboqs not ready:\n\n{info.get('error', 'unknown error')}")
+
+    if can_seal():
+        st.sidebar.success("Client channel: sealed\n\nML-KEM-768 encapsulation + AES-256-GCM")
+    else:
+        st.sidebar.warning("Client channel: plaintext\n\nliboqs not installed on this client")
+
+    st.sidebar.divider()
+    st.sidebar.caption("Demo rehearsal (server needs DEMO_MODE=true)")
+    if st.sidebar.button("Reset replay memory"):
+        try:
+            reset_replay_store()
+            st.sidebar.info("Replay memory cleared - previously seen samples count as new again.")
+        except ApiError:
+            st.sidebar.error("Refused: start the server with DEMO_MODE=true in .env.")
 
 
-def _start_new_session() -> dict:
-    session = session_start()
-    establish_channel(session["session_id"])
-    st.session_state.session = session
-    return session
-
-
-def _run_pipeline(frames: list, frame_timestamps, challenge_response: str, label: str) -> dict:
-    session = st.session_state.session or _start_new_session()
-    session_id = session["session_id"]
-
-    evidence_bytes = frame_to_png_bytes(frames[0])
-    evidence_hash = sha256_hex(evidence_bytes)
-    timestamp = now_iso()
-
-    sign_result = sign_evidence(session_id, evidence_hash, timestamp, challenge_response)
-    frames_b64 = [frame_to_b64(f) for f in frames]
-    verify_result = verify_evidence(
-        session_id,
-        evidence_hash,
-        timestamp,
-        challenge_response,
-        sign_result["signature"],
-        frames_b64,
-        frame_timestamps,
-    )
-
+def _record(label: str, result: dict) -> None:
     st.session_state.log.insert(
         0,
         {
             "time": time.strftime("%H:%M:%S"),
-            "label": label,
-            "session_id": session_id[:8],
-            "binding_accepted": verify_result["binding_accepted"],
-            "detection_ran": verify_result["detection_ran"],
-            "fused_score": verify_result.get("fused_score"),
-            "accepted": verify_result["accepted"],
-            "reason": verify_result["reason"],
-            "total_ms": round(verify_result["timing_ms"].get("total_ms", verify_result["timing_ms"].get("binding_check_ms", 0.0)), 1),
+            "input": label,
+            "decision": "ACCEPT" if result["accepted"] else "REJECT",
+            "decided by": _decided_by(result),
+            "fused score": None if result.get("fused_score") is None else round(result["fused_score"], 2),
+            "channel": result.get("channel", "plaintext"),
+            "server ms": round(result["timing_ms"].get("total_ms", 0.0), 1),
         },
     )
-    # The session nonce is single-use (spec Section 7) - force a fresh
-    # session on the next capture/attack run.
-    st.session_state.session = None
-    return verify_result
 
 
-def _render_result(verify_result: dict) -> None:
-    if verify_result["accepted"]:
-        st.success(f"ACCEPT - {verify_result['reason']}")
-    elif verify_result["binding_accepted"]:
-        st.error(f"REJECT (AI detection) - {verify_result['reason']}")
+def _decided_by(result: dict) -> str:
+    if result["accepted"]:
+        return "all checks passed"
+    failed = [k for k, ok in result["binding_checks"].items() if not ok]
+    if failed:
+        return "binding: " + ", ".join(failed)
+    vetoed = result.get("below_threshold_modules") or []
+    return "AI: " + (", ".join(MODULE_LABELS.get(m, m) for m in vetoed) if vetoed else "fused score below 0.6")
+
+
+def _render_result(result: dict, session: dict) -> None:
+    explanations = result.get("explanations") or []
+    if result["accepted"]:
+        st.success("### ✅ ACCEPT\n" + (explanations[0] if explanations else result["reason"]))
     else:
-        st.error(f"REJECT (transaction binding) - {verify_result['reason']}")
+        stage = (
+            "stopped by the cryptographic layer, before any AI ran"
+            if not result["binding_accepted"]
+            else "stopped by the AI evidence checks"
+        )
+        st.error(f"### ❌ REJECT — {stage}")
+        st.markdown("**Why was this rejected?**")
+        for line in explanations or [result["reason"]]:
+            st.markdown(f"- {line}")
 
-    total_ms = verify_result["timing_ms"].get("total_ms", verify_result["timing_ms"].get("binding_check_ms", 0.0))
-    cols = st.columns(3)
-    cols[0].metric("Fused score", f"{verify_result['fused_score']:.2f}" if verify_result.get("fused_score") is not None else "n/a")
-    cols[1].metric("Binding accepted", str(verify_result["binding_accepted"]))
-    cols[2].metric("Total latency (ms)", f"{total_ms:.1f}")
+    col_crypto, col_binding, col_ai = st.columns([1, 1.3, 1.5])
 
-    if verify_result.get("detection_scores"):
-        st.subheader("Per-detector scores")
-        st.bar_chart(verify_result["detection_scores"])
-        mock_modules = [m for m, is_mock in (verify_result.get("detection_is_mock") or {}).items() if is_mock]
-        if mock_modules:
-            st.caption(f"Running in mock mode (no pretrained checkpoint loaded): {', '.join(mock_modules)}. See detection/README-models.md.")
+    with col_crypto:
+        st.markdown("**1 · Post-quantum channel**")
+        st.write(f"Channel: `{result.get('channel', 'plaintext')}`")
+        st.write(f"Session `{session['session_id'][:8]}`, challenge: *{session['challenge']}*")
+        sealed = result.get("sealed_bytes")
+        if sealed:
+            st.write(f"ML-KEM ciphertext: {sealed['kem_ciphertext']} B")
+            st.write(f"AES-GCM payload: {sealed['aes_gcm_ciphertext'] / 1024:.1f} kB")
 
-    st.subheader("Latency breakdown (crypto/binding vs. detection vs. fusion)")
-    st.json(verify_result["timing_ms"])
+    with col_binding:
+        st.markdown("**2 · Transaction binding**")
+        for check, ok in result["binding_checks"].items():
+            st.write(("✅ " if ok else "❌ ") + CHECK_LABELS.get(check, check))
 
-    with st.expander("Transaction-binding checks (Section 7)"):
-        st.json(verify_result["binding_checks"])
+    with col_ai:
+        st.markdown("**3 · AI evidence checks**")
+        scores = result.get("detection_scores")
+        if not scores:
+            st.write("Not run — evidence was rejected earlier.")
+        else:
+            rows = [
+                {
+                    "detector": MODULE_LABELS.get(m, m),
+                    "score": round(s, 2),
+                    "verdict": "genuine" if s >= MODULE_THRESHOLD else "ATTACK",
+                }
+                for m, s in scores.items()
+            ]
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+            st.write(f"Fused score **{result['fused_score']:.2f}** (accept ≥ {FUSION_THRESHOLD}, and no detector < {MODULE_THRESHOLD})")
+            mock = [MODULE_LABELS.get(m, m) for m, is_mock in (result.get("detection_is_mock") or {}).items() if is_mock]
+            if mock:
+                st.caption("Heuristic (no pretrained checkpoint): " + ", ".join(mock))
+
+    timing = {k: round(v, 3) for k, v in result["timing_ms"].items()}
+    st.caption("Server-side timing (ms): " + ", ".join(f"{k.replace('_ms', '')} {v}" for k, v in timing.items()))
+    with st.expander("Raw server response"):
+        st.json(result)
 
 
-def _live_capture_tab() -> None:
-    st.write("Start a session, fulfil the liveness challenge on camera, then capture and verify a frame.")
+def _to_rgb(uploaded) -> np.ndarray:
+    return np.array(Image.open(uploaded).convert("RGB"))
 
-    if st.button("Start new session", key="live_start"):
-        _start_new_session()
 
-    session = st.session_state.session
-    if session:
-        st.info(f"Session `{session['session_id'][:8]}` - challenge: **{session['challenge']}**")
-    else:
-        st.caption("No active session - click \"Start new session\" to get a nonce + liveness challenge.")
+def _live_tab() -> None:
+    st.markdown(
+        "A real person in front of the laptop camera. **1.** Start a session to get a one-time code and a "
+        "liveness challenge. **2.** Start the camera. **3.** Press **Record** and follow the prompts drawn on "
+        f"the video: look straight at the camera, then perform the challenge ({RECORD_SECONDS:.0f} s). "
+        "**4.** Verify."
+    )
+    if st.button("Start new session", type="primary"):
+        st.session_state.live_session = session_start()
+        st.session_state.live_clip = None
+
+    session = st.session_state.live_session
+    if session is None:
+        st.info("No active session yet.")
+        return
+
+    challenge = session["challenge"]
+    st.info(f"Session `{session['session_id'][:8]}` · nonce `{session['nonce'][:12]}…` · challenge: **{challenge}**")
+
+    _record_clip(challenge)
+
+    with st.expander("Camera stream won't connect? Use two photos instead"):
+        _photo_fallback(session)
+
+    clip = st.session_state.get("live_clip")
+    if not clip:
+        return
+    frames, timestamps = clip
+    st.markdown(f"**Recorded clip:** {len(timestamps)} frames over {timestamps[-1] - timestamps[0]:.1f} s; "
+                f"{len(frames)} evenly spaced frames will be sent (the first one is the frontal frame).")
+    st.image(frames, width=110, caption=[f"frame {i + 1}" for i in range(len(frames))])
+    _verify_live(session, frames, timestamps, key="clip")
+
+
+def _record_clip(challenge: str) -> None:
+    try:
+        import av
+        from streamlit_webrtc import WebRtcMode, webrtc_streamer
+    except ImportError:
+        st.warning("streamlit-webrtc is not installed (`pip install -r requirements-client.txt`); "
+                   "use the two-photo fallback below.")
+        return
+
+    recorder: ClipRecorder = st.session_state.setdefault("recorder", ClipRecorder())
+
+    def on_frame(frame: "av.VideoFrame") -> "av.VideoFrame":
+        # Runs in streamlit-webrtc's worker thread: touch only the recorder
+        # object, never st.session_state.
+        preview = recorder.on_frame(frame.to_ndarray(format="rgb24"), time.time())
+        return av.VideoFrame.from_ndarray(preview, format="rgb24")
 
     try:
-        from streamlit_webrtc import webrtc_streamer
-    except ImportError:
-        st.warning("streamlit-webrtc is not installed. Run `pip install -r requirements-client.txt` to enable live capture.")
+        ctx = webrtc_streamer(
+            key="live-camera",
+            mode=WebRtcMode.SENDRECV,
+            video_frame_callback=on_frame,
+            media_stream_constraints={"video": {"width": {"ideal": 640}, "height": {"ideal": 480}}, "audio": False},
+            async_processing=True,
+        )
+    except Exception as exc:  # the component needs a live Streamlit server + browser
+        st.warning(f"Live video is unavailable here ({exc}). Use the two-photo method below.")
+        return
+    if not ctx.state.playing:
+        st.caption("Press **START** above and allow camera access; the Record button appears once the video is live.")
         return
 
-    def _on_frame(frame):
-        st.session_state.captured_frame = frame.to_ndarray(format="rgb24")
-        return frame
-
-    webrtc_streamer(key="live-capture", video_frame_callback=_on_frame)
-
-    challenge_response = st.text_input("What did you do/say to fulfil the challenge?", key="live_challenge_response")
-
-    if st.button("Capture & Verify", disabled=session is None):
-        frame = st.session_state.captured_frame
-        if frame is None:
-            st.warning("No frame captured yet - make sure the webcam stream above is running.")
+    if st.button(f"⏺ Record {RECORD_SECONDS:.0f} s clip", type="primary"):
+        recorder.start(challenge)
+        status = st.empty()
+        progress = st.progress(0.0)
+        t0 = time.time()
+        while (elapsed := time.time() - t0) < RECORD_SECONDS + 0.2:
+            phase = "Look straight at the camera" if elapsed < LOOK_STRAIGHT_SECONDS else f"Now: **{challenge}**"
+            status.markdown(f"🔴 Recording… {phase}")
+            progress.progress(min(elapsed / RECORD_SECONDS, 1.0))
+            time.sleep(0.1)
+        status.empty()
+        progress.empty()
+        frames, timestamps = recorder.take()
+        if len(frames) < 10:
+            st.error(f"Only {len(frames)} frames arrived while recording. Check that the video above is moving, then record again.")
             return
+        st.session_state.live_clip = (sample_frames(frames), timestamps)
+
+
+def _photo_fallback(session: dict) -> None:
+    challenge = session["challenge"]
+    movement = "number" not in challenge.lower()
+    first = st.camera_input("Photo 1 — look straight at the camera", key=f"cam1-{session['session_id']}")
+    second = st.camera_input(f"Photo 2 — now: {challenge.lower()}", key=f"cam2-{session['session_id']}") if movement else None
+    if first is None or (movement and second is None):
+        return
+    frames = [_to_rgb(first)] + ([_to_rgb(second)] if second is not None else [])
+    _verify_live(session, frames, None, key="photos")
+
+
+def _verify_live(session: dict, frames: list, timestamps: list[float] | None, key: str) -> None:
+    challenge = session["challenge"]
+    if "number" in challenge.lower():
+        response = st.text_input("Type the number you said", key=f"resp-{key}-{session['session_id']}")
+    else:
+        response = "performed: " + challenge.lower()
+
+    ok, message = quality_check(frames[0])
+    if not ok:
+        st.warning(f"Local quality check: {message}. Record again, or submit anyway to see the server's verdict.")
+    submit_anyway = (not ok) and st.checkbox("Submit anyway", key=f"anyway-{key}")
+    if st.button("Verify", type="primary", key=f"verify-{key}", disabled=not ok and not submit_anyway):
         try:
-            result = _run_pipeline([frame], None, challenge_response, label="Live capture")
-            _render_result(result)
+            _, result = run_verification(frames, timestamps, response, session=session)
         except ApiError as exc:
             st.error(str(exc))
+            return
+        st.session_state.live_session = None  # nonce is single-use
+        st.session_state.live_clip = None
+        _record("Live capture", result)
+        _render_result(result, session)
 
 
-def _simulate_attack_tab() -> None:
-    st.write(
-        "Loads a bundled demo-scale sample (see `demo_assets/README-assets.md`) and runs it through the "
-        "identical crypto + binding + AI-detection pipeline as a live capture."
+def _attack_tab() -> None:
+    st.markdown(
+        "A pre-made sample (generated by `scripts/make_demo_assets.py`) sent through the **same** channel, "
+        "binding and detection pipeline as a live capture. The attacker is assumed to know the live challenge, "
+        "so the binding passes and it is the AI layer that must catch it."
     )
+    choice = st.selectbox("Sample", list(SAMPLES))
+    uploaded = st.file_uploader("…or upload your own image/video", type=["jpg", "jpeg", "png", "mp4", "mov"])
 
-    choice = st.selectbox("Attack type", list(ATTACK_FILES.keys()))
-    uploaded = st.file_uploader("...or upload your own sample", type=["jpg", "jpeg", "png", "mp4", "mov"])
-    challenge_response = st.text_input(
-        "Challenge response (simulated - a real attacker may or may not know the current challenge)",
-        value="done",
-        key="attack_challenge_response",
-    )
-
-    if not st.button("Run simulated attack"):
+    if not st.button("Submit sample", type="primary"):
         return
-
     if uploaded is not None:
-        suffix = Path(uploaded.name).suffix
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix) as tmp:
             tmp.write(uploaded.getvalue())
-            path = Path(tmp.name)
+        path, label = Path(tmp.name), f"Upload: {uploaded.name}"
     else:
-        path = ATTACKS_DIR / ATTACK_FILES[choice]
-
+        path, label = ATTACKS_DIR / SAMPLES[choice], choice
     if not path.exists():
-        st.error(f"Sample file not found: `{path}`. See `demo_assets/README-assets.md` to add it.")
+        st.error(f"`{path.name}` not found. Run `python scripts/make_demo_assets.py` first.")
         return
 
     try:
         frames, frame_timestamps = load_attack_file(path)
-        result = _run_pipeline(frames, frame_timestamps, challenge_response, label=choice)
-        _render_result(result)
+        session, result = run_verification(frames, frame_timestamps)
+    except (ApiError, ValueError) as exc:
+        st.error(str(exc))
+        return
+    _record(label, result)
+    if len(frames) > 1:
+        st.caption(f"Video: {len(frames)} frames sampled.")
+    st.image(frames[0], caption=label, width=240)
+    _render_result(result, session)
+
+
+def _tamper_tab() -> None:
+    st.markdown(
+        "The **genuine** sample, but with the protocol attacked. These are rejected by cryptography and session "
+        "binding alone, in about a millisecond, without running any detector."
+    )
+    mode = st.radio("Attack on the protocol", list(TAMPER_MODES), format_func=TAMPER_MODES.get)
+    if not st.button("Run tampered submission", type="primary"):
+        return
+    if mode == "corrupt_channel" and not can_seal():
+        st.error("Needs the sealed channel (liboqs on this client).")
+        return
+    path = ATTACKS_DIR / SAMPLES["Genuine sample (bona fide control)"]
+    if not path.exists():
+        st.error("`genuine_sample.jpg` not found. Run `python scripts/make_demo_assets.py` first.")
+        return
+    try:
+        frames, _ = load_attack_file(path)
+        session, result = run_verification(frames, tamper=mode)
     except ApiError as exc:
         st.error(str(exc))
-    except ValueError as exc:
-        st.error(f"Could not load sample file: {exc}")
+        return
+    _record(f"Tamper: {mode}", result)
+    _render_result(result, session)
 
 
 def main() -> None:
     _init_state()
-    st.title("AI-Based Biometric Evidence Authentication - Live Demo")
-    st.caption("Post-quantum channel (ML-KEM-768 / ML-DSA-65) + transaction binding + AI attack detection")
-    _sidebar_health()
+    st.title("AI-Based Biometric Evidence Authentication")
+    st.caption("Post-quantum channel (ML-KEM-768 / ML-DSA-65) · transaction binding · AI attack detection")
+    _sidebar()
 
-    tab_live, tab_attack = st.tabs(["Live Capture", "Simulate Attack"])
+    tab_live, tab_attack, tab_tamper = st.tabs(["Live Capture", "Simulate Attack", "Tamper with Protocol"])
     with tab_live:
-        _live_capture_tab()
+        _live_tab()
     with tab_attack:
-        _simulate_attack_tab()
+        _attack_tab()
+    with tab_tamper:
+        _tamper_tab()
 
-    st.subheader("Recent verification attempts")
+    st.divider()
+    st.subheader("Verification log")
     if st.session_state.log:
-        st.dataframe(st.session_state.log, use_container_width=True)
+        st.dataframe(st.session_state.log, hide_index=True, use_container_width=True)
     else:
         st.caption("No attempts yet.")
 

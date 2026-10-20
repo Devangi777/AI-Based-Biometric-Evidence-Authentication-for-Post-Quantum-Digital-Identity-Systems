@@ -1,9 +1,9 @@
 """ML-KEM (FIPS 203) session-key establishment, via oqs-python / liboqs.
 
-Runs inside the Dockerized server (see SETUP.md - native liboqs builds
+Runs inside the Dockerized server (see docs/SETUP.md - native liboqs builds
 reliably fail on Windows without a cmake/ninja/C-toolchain). This module is
 the reference implementation named in the spec; if `import oqs` fails here,
-that is a setup problem to fix per SETUP.md, not a reason to substitute a
+that is a setup problem to fix per docs/SETUP.md, not a reason to substitute a
 different crypto library.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 # `oqs` is imported lazily inside each function/class below, rather than at
 # module level, so that this module (and anything that merely imports pure
 # helpers like `derive_channel_key`) can be imported even where liboqs isn't
-# installed - e.g. native Windows without the Docker fallback (SETUP.md).
+# installed - e.g. native Windows without the Docker fallback (docs/SETUP.md).
 # The actual KEM operations still always use the real oqs/liboqs; nothing is
 # substituted or mocked.
 

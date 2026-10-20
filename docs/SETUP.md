@@ -52,7 +52,7 @@ python -c "import oqs; k = oqs.KeyEncapsulation('ML-KEM-768'); k.generate_keypai
 
 Run the crypto + AI server in **Docker Desktop with the WSL2 backend** (where
 liboqs builds cleanly on Linux), and run the **Streamlit demo natively on
-Windows** (for simple webcam access via `streamlit-webrtc`). They talk over
+Windows** (the browser streams the camera to it over WebRTC). They talk over
 `localhost:8000`.
 
 ### 2a. Enable WSL2
@@ -116,9 +116,11 @@ nothing else is bound to port 8000 (`netstat -ano | findstr :8000`).
 
 ## Step 3 — Native Windows venv for the Streamlit demo client
 
-The demo client does **not** need `liboqs` (see README.md "Assumptions" #2 —
-all PQC operations happen server-side in this prototype), so it installs
-cleanly on native Windows Python with no special toolchain:
+The demo client does **not** need `liboqs`, so it installs cleanly on native
+Windows Python with no special toolchain. Without liboqs it sends evidence to
+the plaintext `/verify` endpoint (the sidebar says "Client channel:
+plaintext"); with liboqs available (macOS/Linux, or inside WSL2) it seals the
+payload with ML-KEM-768 + AES-256-GCM via `/verify-sealed`:
 
 ```powershell
 python -m venv .venv
@@ -129,7 +131,7 @@ streamlit run client_demo/streamlit_app.py
 
 The app reads `API_BASE_URL` from `.env` (default `http://localhost:8000`) to
 reach the Dockerized server. Confirm the sidebar shows a green "Server
-reachable" indicator before starting the demo — see DEMO_GUIDE.md.
+reachable" indicator before starting the demo — see GUIDE.md in the repo root.
 
 ## Troubleshooting
 
@@ -139,7 +141,7 @@ reachable" indicator before starting the demo — see DEMO_GUIDE.md.
 | `docker: command not found` in PowerShell | Docker Desktop not installed / not on PATH | Install Docker Desktop (2b), reopen PowerShell |
 | `docker compose up` hangs at liboqs `cmake` step | WSL2 backend not actually engaged | Docker Desktop → Settings → General → enable "Use the WSL 2 based engine"; restart Docker Desktop |
 | Streamlit can't reach the server (`ConnectionError`) | Server container not running, or wrong `API_BASE_URL` | `docker compose ps`; confirm `curl http://localhost:8000/health` works first |
-| Webcam not detected in Streamlit | `streamlit-webrtc` running inside Docker instead of natively | The demo client must run natively on Windows (Step 3), not in the container |
+| Camera prompt never appears in the Live Capture tab | Browser blocked camera access, or the page isn't on `localhost` | Allow camera access for `localhost:8501` in the browser's site settings; browsers only expose cameras on `localhost`/HTTPS |
 | `ModuleNotFoundError: cv2` in the native venv | Installed `requirements.txt` (server deps) instead of `requirements-client.txt` | `pip install -r requirements-client.txt` in the native venv |
 
 ## Running tests

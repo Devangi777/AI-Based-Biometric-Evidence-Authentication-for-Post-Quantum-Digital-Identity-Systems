@@ -1,0 +1,260 @@
+{
+  "channel_ops": [
+    {
+      "op": "AES-256-GCM seal (156 kB)",
+      "median_ms": 0.05066697485744953
+    },
+    {
+      "op": "AES-256-GCM open (156 kB)",
+      "median_ms": 0.04924999666400254
+    }
+  ],
+  "scenarios": [
+    {
+      "scenario": "Genuine capture",
+      "attack_class": "Bona fide",
+      "expected": "ACCEPT",
+      "decision": "ACCEPT",
+      "stopped_by": "\u2014",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": 1.0,
+      "score_morph": 1.0,
+      "score_deepfake": 1.0,
+      "score_replay": 1.0,
+      "score_injection": 1.0,
+      "fused_score": 1.0,
+      "server_ms": 178.2
+    },
+    {
+      "scenario": "Replay of the accepted capture",
+      "attack_class": "Replay (content)",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "AI: replay",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": 1.0,
+      "score_morph": 1.0,
+      "score_deepfake": 1.0,
+      "score_replay": 0.0,
+      "score_injection": 1.0,
+      "fused_score": 0.85,
+      "server_ms": 53.65
+    },
+    {
+      "scenario": "Printed-photo presentation attack",
+      "attack_class": "Presentation attack",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "AI: presentation_attack",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": 0.012,
+      "score_morph": 1.0,
+      "score_deepfake": 1.0,
+      "score_replay": 0.792,
+      "score_injection": 0.89,
+      "fused_score": 0.705,
+      "server_ms": 49.86
+    },
+    {
+      "scenario": "Screen-replay presentation attack",
+      "attack_class": "Presentation attack",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "AI: injection, morph, presentation_attack",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": 0.406,
+      "score_morph": 0.0,
+      "score_deepfake": 1.0,
+      "score_replay": 0.958,
+      "score_injection": 0.197,
+      "fused_score": 0.525,
+      "server_ms": 114.99
+    },
+    {
+      "scenario": "Face morph",
+      "attack_class": "Morphing",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "AI: morph",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": 1.0,
+      "score_morph": 0.0,
+      "score_deepfake": 1.0,
+      "score_replay": 0.75,
+      "score_injection": 1.0,
+      "fused_score": 0.763,
+      "server_ms": 63.16
+    },
+    {
+      "scenario": "Deepfake video",
+      "attack_class": "Deepfake",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "AI: deepfake, injection",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": 1.0,
+      "score_morph": 1.0,
+      "score_deepfake": 0.185,
+      "score_replay": 0.667,
+      "score_injection": 0.345,
+      "fused_score": 0.648,
+      "server_ms": 127.17
+    },
+    {
+      "scenario": "Injected virtual-camera stream",
+      "attack_class": "Injection",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "AI: injection",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": 1.0,
+      "score_morph": 1.0,
+      "score_deepfake": 1.0,
+      "score_replay": 0.75,
+      "score_injection": 0.208,
+      "fused_score": 0.844,
+      "server_ms": 138.17
+    },
+    {
+      "scenario": "Stale evidence",
+      "attack_class": "Replay (temporal)",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "Binding: timestamp_fresh",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": null,
+      "score_morph": null,
+      "score_deepfake": null,
+      "score_replay": null,
+      "score_injection": null,
+      "fused_score": null,
+      "server_ms": 0.83
+    },
+    {
+      "scenario": "Frames swapped after signing",
+      "attack_class": "Evidence substitution",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "Binding: evidence_matches_hash",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": null,
+      "score_morph": null,
+      "score_deepfake": null,
+      "score_replay": null,
+      "score_injection": null,
+      "fused_score": null,
+      "server_ms": 0.81
+    },
+    {
+      "scenario": "Nonce reuse",
+      "attack_class": "Replay (session)",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "Binding: nonce_unused",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": null,
+      "score_morph": null,
+      "score_deepfake": null,
+      "score_replay": null,
+      "score_injection": null,
+      "fused_score": null,
+      "server_ms": 0.81
+    },
+    {
+      "scenario": "Wrong liveness answer",
+      "attack_class": "Liveness (pre-recorded)",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "Binding: challenge_fulfilled",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": null,
+      "score_morph": null,
+      "score_deepfake": null,
+      "score_replay": null,
+      "score_injection": null,
+      "fused_score": null,
+      "server_ms": 0.84
+    },
+    {
+      "scenario": "Tampered sealed payload",
+      "attack_class": "Channel tampering (MITM)",
+      "expected": "REJECT",
+      "decision": "REJECT",
+      "stopped_by": "Binding: channel_authentic",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": null,
+      "score_morph": null,
+      "score_deepfake": null,
+      "score_replay": null,
+      "score_injection": null,
+      "fused_score": null,
+      "server_ms": 0.76
+    },
+    {
+      "scenario": "Control: natural-statistics texture, no face",
+      "attack_class": "Control",
+      "expected": "\u2014",
+      "decision": "ACCEPT",
+      "stopped_by": "\u2014",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": 0.93,
+      "score_morph": 1.0,
+      "score_deepfake": 0.732,
+      "score_replay": 0.875,
+      "score_injection": 1.0,
+      "fused_score": 0.897,
+      "server_ms": 46.65
+    },
+    {
+      "scenario": "Control: white noise (old benchmark 'genuine')",
+      "attack_class": "Control",
+      "expected": "\u2014",
+      "decision": "REJECT",
+      "stopped_by": "AI: deepfake",
+      "channel": "ML-KEM-768 + AES-256-GCM",
+      "score_presentation_attack": 0.76,
+      "score_morph": 1.0,
+      "score_deepfake": 0.0,
+      "score_replay": 0.792,
+      "score_injection": 1.0,
+      "fused_score": 0.659,
+      "server_ms": 23.46
+    }
+  ],
+  "e2e_summary": {
+    "kem_decapsulate_ms": {
+      "median": 0.04054201417602599,
+      "p95": 0.05555001553148031
+    },
+    "aead_decrypt_ms": {
+      "median": 0.2783124800771475,
+      "p95": 0.32381900527980173
+    },
+    "binding_check_ms": {
+      "median": 0.5650629464071244,
+      "p95": 0.6124169623944907
+    },
+    "liveness_check_ms": {
+      "median": 23.186500009614974,
+      "p95": 25.748226730502203
+    },
+    "detection_ms": {
+      "median": 23.255333479028195,
+      "p95": 25.563808952574608
+    },
+    "fusion_ms": {
+      "median": 0.01229200279340148,
+      "p95": 0.023902399698272306
+    },
+    "server_total_ms": {
+      "median": 46.977229008916765,
+      "p95": 51.20233756606467
+    },
+    "end_to_end_ms": {
+      "median": 109.02312499820255,
+      "p95": 114.60799761407543
+    },
+    "accept_rate": 1.0,
+    "vetoes": []
+  }
+}

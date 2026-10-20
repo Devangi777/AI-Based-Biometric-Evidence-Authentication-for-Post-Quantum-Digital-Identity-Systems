@@ -12,26 +12,30 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import io
 import logging
 import time
 
 import numpy as np
+from cryptography.exceptions import InvalidTag
 from fastapi import FastAPI, HTTPException
 from PIL import Image
 from pydantic import BaseModel, Field
 
 from binding.session_binding import check_transaction_binding
+from crypto.channel import evidence_hash_of, open_payload
 from crypto.kem import client_encapsulate, derive_channel_key, kem_details
 from crypto.signature import build_binding_payload, sig_details
 from detection.deepfake_detector import DeepfakeDetector
 from detection.fusion import fuse
 from detection.injection_detector import InjectionDetector
-from detection.liveness_challenge import verify_challenge
+from detection.liveness_challenge import evaluate_challenge
 from detection.morph_detector import MorphDetector
 from detection.presentation_attack import PresentationAttackDetector
 from detection.replay_detector import store as replay_store
 from server.config import settings
+from server.explain import explain
 from server.session_store import Session, nonce_b64, store
 
 logger = logging.getLogger(__name__)
@@ -114,18 +118,28 @@ class VerifyRequest(BaseModel):
     )
 
 
+class SealedVerifyRequest(BaseModel):
+    kem_ciphertext: str = Field(description="hex-encoded ML-KEM ciphertext from the client's encapsulation")
+    aead_nonce: str = Field(description="base64-encoded 12-byte AES-GCM nonce")
+    ciphertext: str = Field(description="base64-encoded AES-256-GCM ciphertext+tag of a VerifyRequest JSON")
+
+
 class VerifyResponse(BaseModel):
     session_id: str
+    channel: str = Field(default="plaintext", description="how the payload reached the server")
     binding_accepted: bool = Field(description="True only if ALL Section 7 step-6 checks pass")
     binding_checks: dict[str, bool]
     binding_reasons: list[str]
     detection_ran: bool = Field(description="False if rejected at the binding stage, before AI detection runs")
     detection_scores: dict[str, float] | None = None
     detection_is_mock: dict[str, bool] | None = None
+    detection_details: dict[str, dict] | None = Field(default=None, description="per-module diagnostic signals")
     fused_score: float | None = None
     below_threshold_modules: list[str] | None = None
     accepted: bool = Field(description="Final ACCEPT/REJECT decision")
     reason: str
+    explanations: list[str] = Field(default_factory=list, description="plain-language reasons for the decision")
+    liveness: dict | None = Field(default=None, description="what the liveness-challenge check measured")
     timing_ms: dict[str, float]
 
 
@@ -139,16 +153,38 @@ def _get_session_or_404(session_id: str) -> Session:
     return session
 
 
-def _decode_frames(frames_b64: list[str]) -> list[np.ndarray]:
+def _decode_frame_bytes(frames_b64: list[str]) -> list[bytes]:
+    try:
+        return [base64.b64decode(b64, validate=True) for b64 in frames_b64]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"frames_b64 must be base64: {exc}") from exc
+
+
+def _decode_frames(frame_bytes: list[bytes]) -> list[np.ndarray]:
     frames = []
-    for i, b64 in enumerate(frames_b64):
+    for i, raw in enumerate(frame_bytes):
         try:
-            raw = base64.b64decode(b64)
             image = Image.open(io.BytesIO(raw)).convert("RGB")
             frames.append(np.array(image))
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"could not decode frames_b64[{i}]: {exc}") from exc
     return frames
+
+
+def _json_safe(details: dict) -> dict:
+    """Detector details as plain JSON numbers/strings (numpy scalars and
+    imagehash objects aren't serializable by pydantic as-is)."""
+    safe = {}
+    for key, value in details.items():
+        if isinstance(value, (bool, str)) or value is None:
+            safe[key] = value
+        elif isinstance(value, (int, float, np.integer, np.floating)):
+            safe[key] = round(float(value), 4)
+        elif isinstance(value, list):
+            safe[key] = [round(float(v), 4) for v in value]
+        else:
+            safe[key] = str(value)
+    return safe
 
 
 # --------------------------------------------------------------------------
@@ -244,21 +280,102 @@ def sign_evidence(session_id: str, req: EvidenceSignRequest) -> EvidenceSignResp
 
 @app.post("/session/{session_id}/verify", response_model=VerifyResponse)
 def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
-    """Full spec Section 3 server-side pipeline: Section 7 step-6 transaction
-    binding (signature, nonce single-use, timestamp freshness, challenge
-    fulfilment) - only if ALL of those pass does the submission proceed to
-    the AI attack-detection pipeline (5 detectors) and the fusion decision
-    engine, per Section 7 step 7 ("Only if all four checks pass does the
-    evidence proceed to the AI attack-detection pipeline")."""
+    """Plaintext variant of the verification pipeline, for clients without
+    liboqs (see /verify-sealed for the ML-KEM + AES-256-GCM channel)."""
+    session = _get_session_or_404(session_id)
+    return _verify_core(session_id, session, req, timing_ms={}, channel="plaintext")
+
+
+@app.post("/session/{session_id}/verify-sealed", response_model=VerifyResponse)
+def verify_evidence_sealed(session_id: str, req: SealedVerifyRequest) -> VerifyResponse:
+    """Verification over the post-quantum channel: the client encapsulated
+    against this session's ML-KEM public key and encrypted the VerifyRequest
+    JSON with AES-256-GCM under k = HKDF-SHA256(K, salt=session nonce), with
+    the session_id as associated data. The server decapsulates, derives the
+    same k and decrypts. Any tampering with the KEM ciphertext, the AEAD
+    nonce/ciphertext, or a submission under another session's id fails GCM
+    authentication and is rejected without running any further checks."""
     session = _get_session_or_404(session_id)
 
+    try:
+        kem_ciphertext = bytes.fromhex(req.kem_ciphertext)
+        aead_nonce = base64.b64decode(req.aead_nonce)
+        ciphertext = base64.b64decode(req.ciphertext)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="kem_ciphertext must be hex; aead_nonce/ciphertext base64") from exc
+
+    t0 = time.perf_counter()
+    try:
+        shared_secret = session.kem.decapsulate(kem_ciphertext)
+    except Exception:
+        shared_secret = None
+    t1 = time.perf_counter()
+
+    plaintext = None
+    if shared_secret is not None:
+        try:
+            plaintext = open_payload(shared_secret, session.nonce, session_id, aead_nonce, ciphertext)
+        except InvalidTag:
+            plaintext = None
+    t2 = time.perf_counter()
+    timing_ms = {"kem_decapsulate_ms": (t1 - t0) * 1000, "aead_decrypt_ms": (t2 - t1) * 1000}
+
+    if plaintext is None:
+        session.nonce_used = True
+        reason = "sealed payload failed ML-KEM decapsulation / AES-256-GCM authentication (tampered or wrong session)"
+        timing_ms["total_ms"] = sum(timing_ms.values())
+        return VerifyResponse(
+            session_id=session_id,
+            channel="ML-KEM-768 + AES-256-GCM",
+            binding_accepted=False,
+            binding_checks={"channel_authentic": False},
+            binding_reasons=[reason],
+            detection_ran=False,
+            accepted=False,
+            reason="rejected at channel stage: " + reason,
+            explanations=explain(accepted=False, binding_checks={"channel_authentic": False}, binding_reasons=[reason]),
+            timing_ms=timing_ms,
+        )
+
+    try:
+        inner = VerifyRequest.model_validate_json(plaintext)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"decrypted payload is not a valid VerifyRequest: {exc}") from exc
+    return _verify_core(session_id, session, inner, timing_ms=timing_ms, channel=f"{settings.kem_alg} + AES-256-GCM")
+
+
+def _verify_core(session_id: str, session: Session, req: VerifyRequest, timing_ms: dict, channel: str) -> VerifyResponse:
+    """Full spec Section 3 server-side pipeline: Section 7 step-6 transaction
+    binding (signature, nonce single-use, timestamp freshness, challenge
+    fulfilment, plus that the submitted frames are the evidence that was
+    signed) - only if ALL of those pass does the submission proceed to the
+    AI attack-detection pipeline (5 detectors) and the fusion decision
+    engine, per Section 7 step 7 ("Only if all four checks pass does the
+    evidence proceed to the AI attack-detection pipeline")."""
     try:
         evidence_hash = bytes.fromhex(req.evidence_hash)
         signature = bytes.fromhex(req.signature)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="evidence_hash and signature must be hex-encoded") from exc
 
-    frames = _decode_frames(req.frames_b64)
+    frame_bytes = _decode_frame_bytes(req.frames_b64)
+    frames = _decode_frames(frame_bytes)
+
+    liveness_ms = 0.0
+    liveness: dict = {}
+
+    def timed_challenge_check(challenge: str, response: str) -> bool:
+        # The liveness check is AI (MediaPipe head-motion), not cryptography;
+        # timed separately so binding_check_ms reports only the crypto and
+        # bookkeeping checks. Its measurements are kept for the explanation.
+        nonlocal liveness_ms
+        start = time.perf_counter()
+        try:
+            ok, measured = evaluate_challenge(challenge, response, frames)
+            liveness.update(measured)
+            return ok
+        finally:
+            liveness_ms = (time.perf_counter() - start) * 1000
 
     t0 = time.perf_counter()
     binding_result = check_transaction_binding(
@@ -272,8 +389,19 @@ def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
         signature=signature,
         nonce_already_used=session.nonce_used,
         freshness_window_seconds=settings.freshness_window_seconds,
-        challenge_check=lambda challenge, response: verify_challenge(challenge, response, frames),
+        challenge_check=timed_challenge_check,
     )
+    # The signature covers evidence_hash, so the frames actually analysed
+    # must be the ones that hash describes - otherwise an attacker could get
+    # a genuine capture's hash signed and then submit different frames.
+    # (Without frames there is nothing to compare; that case is a 400 below
+    # once the remaining checks pass.)
+    if frame_bytes:
+        binding_result._fail(
+            "evidence_matches_hash",
+            hmac.compare_digest(evidence_hash_of(frame_bytes), evidence_hash),
+            "submitted frames do not match the signed evidence_hash (evidence substituted after signing)",
+        )
     t1 = time.perf_counter()
 
     # The nonce is single-use: this verify attempt consumes it regardless of
@@ -281,18 +409,29 @@ def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
     # nonce (spec Section 7: "prevents replay ... nonce ... unique").
     session.nonce_used = True
 
-    timing_ms = {"binding_check_ms": (t1 - t0) * 1000}
+    timing_ms["binding_check_ms"] = (t1 - t0) * 1000 - liveness_ms
+    timing_ms["liveness_check_ms"] = liveness_ms
 
     if not binding_result.accepted:
         logger.info("session=%s binding_rejected reasons=%s", session_id, binding_result.reasons)
+        timing_ms["total_ms"] = sum(timing_ms.values())
         return VerifyResponse(
             session_id=session_id,
+            channel=channel,
             binding_accepted=False,
             binding_checks=binding_result.checks,
             binding_reasons=binding_result.reasons,
             detection_ran=False,
             accepted=False,
             reason="rejected at transaction-binding stage: " + "; ".join(binding_result.reasons),
+            explanations=explain(
+                accepted=False,
+                binding_checks=binding_result.checks,
+                binding_reasons=binding_result.reasons,
+                liveness=liveness,
+                challenge=session.challenge,
+            ),
+            liveness=_json_safe(liveness),
             timing_ms=timing_ms,
         )
 
@@ -321,6 +460,7 @@ def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
     timing_ms["detection_ms"] = (t3 - t2) * 1000
     timing_ms["fusion_ms"] = (t4 - t3) * 1000
     timing_ms["total_ms"] = sum(timing_ms.values())
+    detection_details = {r.module: _json_safe(r.details) for r in detection_results}
 
     if fusion_result.accepted:
         reason = f"accepted (fused_score={fusion_result.fused_score:.2f} >= threshold={fusion_result.threshold})"
@@ -333,18 +473,42 @@ def verify_evidence(session_id: str, req: VerifyRequest) -> VerifyResponse:
 
     return VerifyResponse(
         session_id=session_id,
+        channel=channel,
         binding_accepted=True,
         binding_checks=binding_result.checks,
         binding_reasons=[],
         detection_ran=True,
         detection_scores=fusion_result.per_module_scores,
         detection_is_mock=fusion_result.per_module_is_mock,
+        detection_details=detection_details,
         fused_score=fusion_result.fused_score,
         below_threshold_modules=fusion_result.below_threshold_modules,
         accepted=fusion_result.accepted,
         reason=reason,
+        explanations=explain(
+            accepted=fusion_result.accepted,
+            binding_checks=binding_result.checks,
+            binding_reasons=[],
+            detection_scores=fusion_result.per_module_scores,
+            detection_details=detection_details,
+            below_threshold_modules=fusion_result.below_threshold_modules,
+            fused_score=fusion_result.fused_score,
+            accept_threshold=fusion_result.threshold,
+        ),
+        liveness=_json_safe(liveness),
         timing_ms=timing_ms,
     )
+
+
+@app.post("/demo/reset-replay-store")
+def reset_replay_store() -> dict:
+    """Forget previously seen evidence so a demo can be rehearsed with the
+    same genuine sample. Disabled unless DEMO_MODE=true: in production this
+    would let anyone erase replay protection."""
+    if not settings.demo_mode:
+        raise HTTPException(status_code=403, detail="only available with DEMO_MODE=true")
+    replay_store.clear()
+    return {"replay_store_cleared": True}
 
 
 @app.delete("/session/{session_id}")

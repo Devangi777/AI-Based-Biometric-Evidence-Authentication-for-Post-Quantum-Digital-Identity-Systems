@@ -60,3 +60,6 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local quantum-experiment venv (report/requirements-report.txt)
+qvenv/

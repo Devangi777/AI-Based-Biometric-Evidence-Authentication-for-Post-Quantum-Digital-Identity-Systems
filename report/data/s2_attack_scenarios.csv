@@ -1,0 +1,15 @@
+scenario,attack_class,expected,decision,stopped_by,channel,score_presentation_attack,score_morph,score_deepfake,score_replay,score_injection,fused_score,server_ms
+Genuine capture,Bona fide,ACCEPT,ACCEPT,—,ML-KEM-768 + AES-256-GCM,1.0,1.0,1.0,1.0,1.0,1.0,178.2
+Replay of the accepted capture,Replay (content),REJECT,REJECT,AI: replay,ML-KEM-768 + AES-256-GCM,1.0,1.0,1.0,0.0,1.0,0.85,53.65
+Printed-photo presentation attack,Presentation attack,REJECT,REJECT,AI: presentation_attack,ML-KEM-768 + AES-256-GCM,0.012,1.0,1.0,0.792,0.89,0.705,49.86
+Screen-replay presentation attack,Presentation attack,REJECT,REJECT,"AI: injection, morph, presentation_attack",ML-KEM-768 + AES-256-GCM,0.406,0.0,1.0,0.958,0.197,0.525,114.99
+Face morph,Morphing,REJECT,REJECT,AI: morph,ML-KEM-768 + AES-256-GCM,1.0,0.0,1.0,0.75,1.0,0.763,63.16
+Deepfake video,Deepfake,REJECT,REJECT,"AI: deepfake, injection",ML-KEM-768 + AES-256-GCM,1.0,1.0,0.185,0.667,0.345,0.648,127.17
+Injected virtual-camera stream,Injection,REJECT,REJECT,AI: injection,ML-KEM-768 + AES-256-GCM,1.0,1.0,1.0,0.75,0.208,0.844,138.17
+Stale evidence,Replay (temporal),REJECT,REJECT,Binding: timestamp_fresh,ML-KEM-768 + AES-256-GCM,,,,,,,0.83
+Frames swapped after signing,Evidence substitution,REJECT,REJECT,Binding: evidence_matches_hash,ML-KEM-768 + AES-256-GCM,,,,,,,0.81
+Nonce reuse,Replay (session),REJECT,REJECT,Binding: nonce_unused,ML-KEM-768 + AES-256-GCM,,,,,,,0.81
+Wrong liveness answer,Liveness (pre-recorded),REJECT,REJECT,Binding: challenge_fulfilled,ML-KEM-768 + AES-256-GCM,,,,,,,0.84
+Tampered sealed payload,Channel tampering (MITM),REJECT,REJECT,Binding: channel_authentic,ML-KEM-768 + AES-256-GCM,,,,,,,0.76
+"Control: natural-statistics texture, no face",Control,—,ACCEPT,—,ML-KEM-768 + AES-256-GCM,0.93,1.0,0.732,0.875,1.0,0.897,46.65
+Control: white noise (old benchmark 'genuine'),Control,—,REJECT,AI: deepfake,ML-KEM-768 + AES-256-GCM,0.76,1.0,0.0,0.792,1.0,0.659,23.46

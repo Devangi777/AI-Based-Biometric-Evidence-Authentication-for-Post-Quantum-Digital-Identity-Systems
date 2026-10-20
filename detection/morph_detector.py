@@ -1,119 +1,104 @@
 """Face Morphing Detection - spec Section 6.2.
 
 Spec explicitly allows a non-ML approach here ("feature-based morphing
-artifact detection ... or landmark-symmetry deviation model"), so unlike
-presentation_attack.py / deepfake_detector.py this module has a genuine
-working implementation rather than a stub-plus-mock:
+artifact detection"), so this module is a working signal-processing detector
+rather than a stub-plus-mock. A morph is made by pixel-averaging two
+identities, which leaves two artifacts in the fine detail (high-pass
+residual) of the face region that a single live capture does not have:
 
-- If MediaPipe Face Mesh is importable, use real facial landmarks to measure
-  left/right symmetry deviation around the eyes/mouth/jaw - morphing two
-  identities together tends to blend landmark positions asymmetrically and
-  softens edges around the blend seams.
-- Otherwise, fall back to a pixel-domain proxy: mirror the face crop
-  left-right and measure the residual difference directly. Weaker (no
-  landmark alignment) but needs zero extra dependencies.
+- Ghosting: if the two source faces are not perfectly aligned, every edge
+  appears twice at a fixed (dy, dx) offset, which shows up as a sharp
+  secondary peak in the 2-D autocorrelation of the high-pass image. Genuine
+  detail only has smooth, slowly decaying correlation (texture, blur), so
+  the score uses peak *prominence* over its 2-pixel neighbourhood.
+- Artificial symmetry: morphing tools align both faces to a common mean
+  shape, and blending a face with a mirrored second identity makes skin
+  texture, hair and noise left/right symmetric. Real faces are only
+  symmetric in coarse structure, not in fine detail.
 
-Both paths are legitimate signal-processing methods, not a trained
-classifier, so there is no separate "pretrained" checkpoint to download for
-this module - `mode` only controls whether MediaPipe is *allowed*, not
-whether a model file is loaded.
+Measured on a public-domain portrait (genuine, JPEG/noise/blur variants) vs.
+50/50 blends: ghost prominence <= 0.10 genuine vs. 0.22-0.37 for blends
+misaligned by 2-4% of face width; mirror correlation ~0.03 genuine vs. ~0.99
+for blends with a mirrored identity.
+
+MediaPipe Face Mesh (if importable and `mode != "mock"`) is only used to
+crop the face region and to report landmark asymmetry as a diagnostic;
+without it the central region of the frame is analysed. Landmark symmetry
+is not scored: it measured 0.03-0.045 face widths for both genuine faces and
+morphs, so it cannot discriminate.
 """
 from __future__ import annotations
 
-import logging
-
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from detection.base import DetectionResult, clip01
+from detection.face_region import FaceRegionFinder
 
-logger = logging.getLogger(__name__)
+
+_ANALYSIS_WIDTH = 256  # larger face regions are downscaled to this; smaller ones are never upscaled
+# Ghost offsets searched (radius, as a fraction of the analysed width).
+# Below ~4% the correlation is ordinary optical blur, not a second face.
+_GHOST_RADIUS = (0.04, 0.15)
+# (no-evidence, full-evidence) ramps for each artifact
+_GHOST_RAMP = (0.13, 0.22)
+_MIRROR_RAMP = (0.20, 0.50)
+
+
+def _ghost_prominence(detail: np.ndarray) -> float:
+    """Largest sharp secondary peak in the normalized 2-D autocorrelation of
+    `detail`, searched over offsets whose radius lies in _GHOST_RADIUS."""
+    h, w = detail.shape
+    shape = (2 * h, 2 * w)  # zero-pad: linear, not circular, correlation
+    corr = np.real(np.fft.ifft2(np.abs(np.fft.fft2(detail, s=shape)) ** 2))
+    overlap = np.real(np.fft.ifft2(np.abs(np.fft.fft2(np.ones_like(detail), s=shape)) ** 2))
+    corr = np.fft.fftshift(corr / np.maximum(overlap, 1.0))
+    neighbourhood = (np.roll(corr, 2, 0) + np.roll(corr, -2, 0) + np.roll(corr, 2, 1) + np.roll(corr, -2, 1)) / 4
+    prominence = corr - neighbourhood
+    yy, xx = np.indices(corr.shape)
+    radius = np.hypot(yy - h, xx - w)
+    ring = (radius >= max(4.0, _GHOST_RADIUS[0] * w)) & (radius <= _GHOST_RADIUS[1] * w)
+    return float(prominence[ring].max()) if ring.any() else 0.0
+
+
+def _ramp(x: float, lo_hi: tuple[float, float]) -> float:
+    lo, hi = lo_hi
+    return clip01((x - lo) / (hi - lo))
 
 
 class MorphDetector:
     module_name = "morph"
 
     def __init__(self, mode: str = "pretrained", device: str = "cpu"):
-        # `mode="mock"` forces the pixel-mirror fallback even if MediaPipe is
-        # installed, mainly so tests/evaluation can compare both paths.
+        # `mode="mock"` disables MediaPipe face cropping (central crop only),
+        # mainly so tests/evaluation run without the mediapipe dependency.
         self.device = device
         self.mode = mode
-        self._face_mesh = None
-        if mode != "mock":
-            self._face_mesh = self._try_load_mediapipe()
-
-    def _try_load_mediapipe(self):
-        try:
-            import mediapipe as mp
-
-            return mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True)
-        except Exception as exc:
-            logger.warning("Morph: MediaPipe unavailable (%s); using pixel-mirror symmetry fallback.", exc)
-            return None
+        self._faces = FaceRegionFinder(use_mediapipe=mode != "mock", owner="Morph")
 
     def predict(self, frame: np.ndarray) -> DetectionResult:
-        if self._face_mesh is not None:
-            result = self._predict_landmarks(frame)
-            if result is not None:
-                return result
-        return self._predict_pixel_mirror(frame)
-
-    def _predict_landmarks(self, frame: np.ndarray) -> DetectionResult | None:
-        results = self._face_mesh.process(frame)
-        if not results.multi_face_landmarks:
-            return None
-
-        landmarks = results.multi_face_landmarks[0].landmark
-        h, w = frame.shape[:2]
-        pts = np.array([(lm.x * w, lm.y * h) for lm in landmarks])
-
-        # Symmetric landmark index pairs across the vertical face midline
-        # (MediaPipe's 468-point topology): eye corners, mouth corners, jaw.
-        symmetric_pairs = [(33, 263), (61, 291), (176, 400), (105, 334), (159, 386)]
-        center_x = pts[:, 0].mean()
-
-        deviations = []
-        for left_idx, right_idx in symmetric_pairs:
-            if left_idx >= len(pts) or right_idx >= len(pts):
-                continue
-            left_mirrored_x = 2 * center_x - pts[left_idx, 0]
-            dx = abs(left_mirrored_x - pts[right_idx, 0])
-            dy = abs(pts[left_idx, 1] - pts[right_idx, 1])
-            deviations.append(np.hypot(dx, dy))
-
-        if not deviations:
-            return None
-
-        mean_deviation = float(np.mean(deviations))
-        face_width = float(pts[:, 0].max() - pts[:, 0].min()) or 1.0
-        normalized_deviation = mean_deviation / face_width
-
-        # Higher deviation => more likely morphed/blended => lower "genuine" score.
-        score = clip01(1.0 - normalized_deviation / 0.08)
-
+        region, crop_details = self._faces.crop(frame)
+        ghost, mirror = self._artifact_correlations(region)
+        score = 1.0 - max(_ramp(ghost, _GHOST_RAMP), _ramp(mirror, _MIRROR_RAMP))
         return DetectionResult(
             module=self.module_name,
             score=score,
-            is_mock=False,
-            details={"mean_landmark_deviation_px": mean_deviation, "normalized_deviation": normalized_deviation},
+            is_mock=not self._faces.available,
+            details={"ghost_prominence": ghost, "mirror_correlation": mirror, **crop_details},
         )
 
-    def _predict_pixel_mirror(self, frame: np.ndarray) -> DetectionResult:
-        img = Image.fromarray(frame).convert("L").resize((128, 128))
-        arr = np.asarray(img, dtype=np.float64)
-        mirrored = arr[:, ::-1]
-        residual = np.abs(arr - mirrored)
-        asymmetry = float(residual.mean())
+    @staticmethod
+    def _artifact_correlations(region: np.ndarray) -> tuple[float, float]:
+        gray = Image.fromarray(region).convert("L")
+        if gray.width > _ANALYSIS_WIDTH:
+            # Only ever downscale: upscaling a small face box interpolates
+            # neighbouring pixels together, which reads as false "ghosting".
+            gray = gray.resize((_ANALYSIS_WIDTH, max(32, round(gray.height * _ANALYSIS_WIDTH / gray.width))), Image.BILINEAR)
+        g = np.asarray(gray, dtype=np.float64)
+        detail = g - np.asarray(gray.filter(ImageFilter.GaussianBlur(2)), dtype=np.float64)
+        detail = detail[8:-8, 8:-8]  # drop blur edge effects
+        detail = (detail - detail.mean()) / (detail.std() + 1e-9)
 
-        # Normalize: real faces are naturally somewhat asymmetric; morphs
-        # tend to show either unusually smooth blending (low asymmetry with
-        # low local variance) or ghosting artifacts (localized high-residual
-        # patches). This proxy uses overall asymmetry as a weak signal only.
-        score = clip01(1.0 - abs(asymmetry - 18.0) / 30.0)
-
-        return DetectionResult(
-            module=self.module_name,
-            score=score,
-            is_mock=True,
-            details={"pixel_mirror_asymmetry": asymmetry},
-        )
+        ghost = _ghost_prominence(detail)
+        mirror = float((detail * detail[:, ::-1]).mean())
+        return ghost, mirror

@@ -1,183 +1,303 @@
 # AI-Based Biometric Evidence Authentication for Post-Quantum Digital Identity Systems
 
-A prototype that combines **post-quantum cryptography** (ML-KEM-768 / ML-DSA-65
-via `liboqs`/`oqs-python`), **AI-based biometric attack detection** (presentation
-attack, morphing, deepfake, replay, injection), and a **transaction-binding /
-freshness mechanism** to verify that a submitted face capture is genuine, live,
-unmanipulated, and freshly captured for a specific verification session — over
-a channel secured against quantum adversaries.
+Remote identity checks (bank onboarding, e-KYC, digital ID) ask a person to
+show their face to a camera and send it to a server. Two things can go
+wrong. The channel is protected by RSA and elliptic-curve cryptography,
+which quantum computers will break, so sessions recorded today can be
+decrypted later. And even a perfectly secure channel says nothing about
+whether the face in it is real: a deepfake sent over TLS is still a deepfake.
 
-Full design rationale lives in [`PQ-Biometric-Auth-Spec.md`](PQ-Biometric-Auth-Spec.md).
-This README documents what was actually built and any assumptions made where
-the spec left something open.
+This project is a working prototype that addresses both. It checks that a
+face capture is **genuine, live, unaltered, fresh and bound to one
+session**, and sends it over a channel that stays secure against quantum
+computers.
 
-## Why this exists
+![Architecture](report/figures/fig_a1_architecture.png)
 
-Cryptography secures the *channel*. It says nothing about whether the
-*biometric evidence* flowing through that channel is genuine. This project
-shows both halves working together: a secure PQC channel **and** an AI
-pipeline that catches deepfakes, morphs, spoofed presentations, replayed
-evidence, and injected streams — bound to a single-use session nonce so even
-a genuine, previously-captured sample can't be replayed.
+## Key features
 
-## Architecture
+- **Post-quantum channel.** The client runs **ML-KEM-768** (FIPS 203)
+  against the session's key and encrypts the evidence with **AES-256-GCM**.
+- **Transaction binding.** An **ML-DSA-65** (FIPS 204) signature over the
+  evidence fingerprint, a single-use 256-bit nonce, a timestamp and the
+  liveness-challenge answer; plus a 30 s freshness window and a check that
+  the analysed frames are the signed ones. Any failure rejects the
+  submission in about 1 ms, before any AI runs.
+- **Live recording with a liveness challenge.** The dashboard records a
+  4 s clip from the browser camera while the person performs a randomly
+  chosen task (turn head, nod, say a number).
+- **Five AI evidence checks:** presentation attack (photo or screen), face
+  morph, deepfake, replay and injection (virtual camera), combined by
+  weighted fusion where any single detector can veto.
+- **Explained decisions.** Every rejection comes with plain-language reasons
+  and the values that were measured.
+- **Quantum threat model, simulated.** Shor's algorithm, Grover's algorithm
+  and a quantum random number generator implemented in Qiskit and run on
+  ideal and noisy simulators (`report/`).
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                            CLIENT SIDE                                │
-│  ┌──────────────┐    ┌───────────────────┐    ┌──────────────────┐  │
-│  │ Camera/Sensor│───▶│ Local pre-checks    │───▶│ Session Nonce +   │  │
-│  │ Capture       │    │ (frame quality,    │    │ Challenge-Response │  │
-│  │               │    │ face detection)     │    │ (liveness prompt)  │  │
-│  └──────────────┘    └───────────────────┘    └──────────────────┘  │
-│                                                          │            │
-│                                                          ▼            │
-│                                          ┌──────────────────────────┐│
-│                                          │ Evidence Hash + Metadata ││
-│                                          │ (SHA-256 of frame/video, ││
-│                                          │ timestamp, session_id)   ││
-│                                          └──────────────────────────┘│
-│                                                          │            │
-│                                                          ▼            │
-│                                          ┌──────────────────────────┐│
-│                                          │ ML-DSA Signature over    ││
-│                                          │ (hash ‖ session_id ‖ ts) ││
-│                                          └──────────────────────────┘│
-└─────────────────────────────────────────┼─────────────────────────────┘
-                                           │
-                              ML-KEM-encrypted channel
-                                           │
-┌──────────────────────────────────────────▼─────────────────────────────┐
-│                            SERVER SIDE                                  │
-│  ┌────────────────────┐   ┌─────────────────────────────────────────┐ │
-│  │ ML-KEM Decapsulate  │──▶│ ML-DSA Verify (signature, freshness,    │ │
-│  │ (session key)       │   │ session_id match, timestamp window)     │ │
-│  └────────────────────┘   └─────────────────────────────────────────┘ │
-│                                           │                             │
-│                                           ▼                             │
-│                          ┌─────────────────────────────────┐          │
-│                          │   AI ATTACK-DETECTION PIPELINE   │          │
-│                          │  1. Presentation-Attack (PAD)    │          │
-│                          │  2. Face-Morphing Detector       │          │
-│                          │  3. Deepfake Detector            │          │
-│                          │  4. Replay Detector (pHash vs DB)│          │
-│                          │  5. Injection Detector           │          │
-│                          └───────────────────┬───────────────┘          │
-│                                              ▼                          │
-│                          ┌──────────────────────────────────┐          │
-│                          │ Decision Engine (fusion of scores)│          │
-│                          │ → ACCEPT / REJECT + confidence    │          │
-│                          └──────────────────────────────────┘          │
-└──────────────────────────────────────────────────────────────────────┘
-```
+## How it works
 
-See [`PQ-Biometric-Auth-Spec.md`](PQ-Biometric-Auth-Spec.md) Section 3 for the
-canonical diagram and Section 7 for the transaction-binding sequence.
+![Verification sequence](report/figures/fig_a2_binding_sequence.png)
 
-## Repository layout
+1. **Session.** The server issues a session ID, a one-time nonce, a random
+   liveness challenge and an ML-KEM public key.
+2. **Capture.** The person records a short clip: looking at the camera,
+   then performing the challenge.
+3. **Bind.** The frames' SHA-256 fingerprint is signed with ML-DSA together
+   with the nonce, timestamp and challenge answer.
+4. **Seal.** The client derives a key with ML-KEM-768 and HKDF and
+   encrypts the submission with AES-256-GCM.
+5. **Gate.** The server decrypts and checks the signature, nonce,
+   freshness, challenge and frame fingerprint. Any failure → REJECT.
+6. **Detect and decide.** Five detectors score the evidence. The fusion
+   engine accepts only if the weighted score is ≥ 0.6 and no detector is
+   below 0.5.
+7. **Explain.** The response says why.
 
-```
-crypto/         ML-KEM / ML-DSA wrappers (oqs-python) + classical RSA/ECDSA baseline
-detection/      5 attack-detection modules + fusion engine
-binding/        Session nonce / challenge / freshness enforcement (Section 7)
-server/         FastAPI app tying crypto + binding + detection together
-client_demo/    Streamlit demo (live webcam mode + simulate-attack mode)
-evaluation/     Benchmark harness producing Section 8 metrics as CSV + charts
-demo_assets/    Small, self-generated demo files for "Simulate Attack" mode
-datasets/       Gitignored - download scripts only, see datasets/download_samples.md
-tests/          Unit tests: crypto round-trip, detector smoke tests, binding logic
-```
+| Detector | What it checks |
+|---|---|
+| Presentation attack | Recapture cues on the face: true black level (paper and screens can't show black), sharpness, colour saturation |
+| Morph | Double contours ("ghosting") and unnaturally symmetric fine texture left by blending two faces |
+| Deepfake | Excess very-fine-detail energy left by face generators' upsampling |
+| Replay | Whether this exact capture was already submitted: same picture **and** same pixel-level detail |
+| Injection | Machine-perfect frame timing and re-encoding artifacts of video files and virtual cameras |
 
-## Quick start
+Why post-quantum: Shor's algorithm breaks RSA and elliptic curves, and
+Grover's algorithm halves symmetric key strength. Both are simulated in
+[`report/scripts/quantum_experiments.py`](report/scripts/quantum_experiments.py).
+Detailed design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-**This project uses a split architecture on Windows** (see [SETUP.md](SETUP.md)
-for why): the crypto + AI server runs in Docker (Linux, where `liboqs` builds
-cleanly), and the Streamlit demo runs natively on Windows for webcam access.
+## Results at a glance
+
+Measured on an Apple M3 laptop; details in [`report/FINAL_REPORT.md`](report/FINAL_REPORT.md) §4.4.
+
+| | Result |
+|---|---|
+| ML-KEM-768 encaps + decaps vs RSA-3072 | 0.044 ms vs 2.14 ms (48× faster) |
+| Post-quantum path on the server (decaps + AES-GCM + binding checks) | 0.88 ms, 1.9% of server time |
+| Full verification, client side (sealed, 5 frames) | 109 ms median |
+| Protocol attacks (stale, swapped frames, nonce reuse, wrong challenge, tampered channel) | 5/5 rejected in about 1 ms, before any AI |
+| Content attacks (replay, printed photo, screen replay, morph, deepfake, injection) | 6/6 rejected by the intended detector |
+| Genuine submissions | 41/41 accepted |
+| Shor (N = 15) / Grover (4 qubits), ideal → 1% gate error | 0.499 → 0.132 / 0.960 → 0.430 success |
+
+![Demo samples](report/figures/fig_r6_demo_samples.png)
+
+## Getting started
+
+Two ways to run the server: **Docker**, which isolates the liboqs build and
+gives the same image on every machine, or **native**, which is slightly
+faster to iterate on. The dashboard always runs natively, because it uses
+your browser's camera.
+
+### Option A: Docker server + native dashboard (macOS)
+
+**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+installed and running (the whale icon in the menu bar), Python 3.11, and at
+least 10 GB of free disk space. Works natively on Apple Silicon and Intel
+Macs.
+
+**1. Configure.** From the repo root:
 
 ```bash
-# 1. Server (Docker)
 cp .env.example .env
-docker compose up --build
-# health check:
-curl http://localhost:8000/health
+```
 
-# 2. Client demo (native Windows Python)
-python -m venv .venv
-.venv\Scripts\activate
+`.env` holds every setting (algorithms, thresholds, port) with working
+defaults; no edits are needed to get started.
+
+**2. Build and start the server.**
+
+```bash
+docker compose up --build
+```
+
+`docker compose` reads `docker-compose.yml`, which builds `Dockerfile`: a
+Debian-slim image with the liboqs toolchain (cmake, ninja, gcc) that
+installs `requirements.txt` and compiles liboqs. The first build takes a few
+minutes; later builds are cached unless `requirements.txt` or the
+`Dockerfile` change. The server then listens on `localhost:8000`. Wait for
+`Application startup complete`. To run it in the background, use
+`docker compose up --build -d` and follow the logs with
+`docker compose logs -f server`.
+
+**3. Check it,** in a new terminal:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Expect `{"status":"ok","kem_alg":"ML-KEM-768","sig_alg":"ML-DSA-65","liboqs_ready":true}`.
+The interactive API docs are at `http://localhost:8000/docs`.
+
+**4. Start the dashboard:**
+
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-client.txt
 streamlit run client_demo/streamlit_app.py
 ```
 
-Full step-by-step instructions, including what to do if `docker` isn't
-installed yet: **[SETUP.md](SETUP.md)**.
-Presenting the live demo: **[DEMO_GUIDE.md](DEMO_GUIDE.md)**.
+This opens `http://localhost:8501`. The sidebar should say **Server online**.
+With only `requirements-client.txt` installed it says **Client channel:
+plaintext**: evidence goes to the server's plaintext `/verify` endpoint. The
+demo is the same; only the wire format differs. For the full post-quantum
+channel on the client too (**Client channel: sealed**), also build liboqs on
+the Mac:
 
-## Assumptions made where the spec was open-ended
+```bash
+brew install cmake ninja openssl
+pip install -r requirements.txt -r requirements-client.txt
+```
 
-These are called out here (per the spec's own instruction to state
-assumptions explicitly rather than guess silently) and are also noted in the
-commit messages that introduced them:
+**5. Build the demo samples and run the self-check:**
 
-1. **Python version on the Windows host.** The spec targets Python 3.11; the
-   machine this was built on has Python 3.10 natively installed (no 3.11
-   found on PATH). Native Windows use is limited to the Streamlit client
-   anyway (see #2), which is not version-sensitive; the Dockerfile pins
-   `python:3.11-slim` for the server, matching the spec exactly where it
-   matters (the crypto/AI layer). If you set up a native Python 3.11 venv on
-   Windows, everything here still works unchanged.
+```bash
+pip install scikit-image
+python scripts/make_demo_assets.py        # writes demo_assets/attacks/ (gitignored)
+python scripts/demo_check.py --explain    # expects "12/12 scenarios behaved as expected"
+```
 
-2. **Where client-side ML-DSA signing actually runs.** Section 3 shows the
-   *client* computing the evidence hash and signing it with ML-DSA before
-   sending it over the ML-KEM channel. Section 11 also says the Streamlit
-   demo should run natively on Windows for webcam access, split from the
-   Dockerized crypto/AI server. Literally following both at once would
-   require `oqs-python` (and thus a working liboqs native build) on the
-   Windows host running Streamlit — which is exactly the install failure
-   Section 11 exists to avoid.
+**Managing the container:**
 
-   **Resolution:** in this prototype, *all* PQC operations (ML-KEM
-   encapsulation/decapsulation **and** ML-DSA signing/verification) are
-   performed by the Dockerized `server/` process, which exposes them as
-   distinct "as-client" and "as-server" endpoints/functions
-   (`server/main.py`: `POST /session/{id}/sign-evidence` acts as the client
-   signer, `POST /session/{id}/verify` acts as the server verifier). The
-   Streamlit app only computes the SHA-256 evidence hash locally (no PQC
-   library needed for that) and orchestrates calls to the server for
-   everything cryptographic. This preserves the actual protocol being
-   demonstrated (nonce/timestamp/challenge-bound ML-DSA signature verified
-   server-side, ML-KEM-derived channel key) without requiring a second
-   native liboqs build. It does **not** demonstrate a hardened, physically
-   separate client device holding its own private key — that would be the
-   natural next step for a production system and is documented here rather
-   than silently glossed over. `crypto/kem.py` and `crypto/signature.py` are
-   written as plain reusable wrappers with no assumption about which process
-   calls them, so this can be changed later by simply pointing a real client
-   process at them once liboqs is available there too (e.g. once teammates
-   run the whole stack in Docker/WSL2, or install VS Build Tools + CMake +
-   Ninja natively).
+```bash
+docker compose ps                  # status
+docker compose logs -f server      # logs
+docker compose down                # stop and remove
+docker compose up -d --force-recreate   # apply .env changes
+```
 
-3. **Docker Desktop is not installed on this machine.** `docker`/`docker
-   compose` are unavailable in this environment, so the `docker-compose.yml`
-   / `Dockerfile` here are written and reviewed carefully against liboqs's
-   documented build requirements but have **not** been build-tested end to
-   end in this environment. `python -c "import oqs"` **was** tested natively
-   on Windows here and confirmed to fail exactly as Section 11 predicts
-   (`cmake` not found during liboqs's self-build step) — confirming the
-   Docker/WSL2 fallback is the right path rather than a precaution taken on
-   faith. Before the live demo, run through SETUP.md's verification steps
-   once to confirm the image builds on your machine.
+`crypto/`, `detection/`, `binding/`, `server/`, `evaluation/` and
+`demo_assets/` are mounted into the container and the server runs with
+`--reload`, so code edits apply without a rebuild. Only dependency changes
+need `docker compose up --build`.
 
-4. **AI detection checkpoints are not downloaded in this environment.** No
-   internet-downloaded model weights are bundled in the repo (per the task
-   instructions and `.gitignore`). Every detector in `detection/` has a
-   documented pretrained path (exact source, per Section 6) and a deterministic
-   **mock mode** fallback that runs with zero downloads so the full pipeline
-   (crypto → binding → detection → fusion) is exercisable and testable today.
-   See `detection/README-models.md` for exactly what to download and where to
-   put it to switch each module from mock to pretrained.
+**Troubleshooting (macOS + Docker):**
 
-## Development conventions
+| Symptom | Fix |
+|---|---|
+| `Cannot connect to the Docker daemon` | Open Docker Desktop and wait until it is running |
+| Container *unhealthy*, logs show `input/output error` | Your Mac's disk is (nearly) full and Docker's VM can't write. Free space, then quit and reopen Docker Desktop |
+| Build fails or hangs at the liboqs/cmake step | Docker Desktop → Settings → Resources: more CPU/memory, then `docker compose up --build` |
+| `port is already allocated` on 8000 | Something else owns port 8000 (often a native `uvicorn`): stop it, or `docker compose down` |
+| `curl: (7) Failed to connect` right after starting | Still starting; wait for `Application startup complete` |
+| Dashboard says *Server unreachable* | Check `curl http://localhost:8000/health`; `API_BASE_URL` in `.env` must be `http://localhost:8000` |
 
-See [CLAUDE.md](CLAUDE.md) for standing rules followed in this repo (update
-README/CHANGELOG on behavior change, never commit datasets/weights/venvs, run
-tests before declaring work done, state assumptions explicitly).
+### Option B: fully native (no Docker)
+
+```bash
+brew install cmake ninja openssl
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-client.txt
+cp .env.example .env
+
+uvicorn server.main:app --port 8000          # terminal 1
+streamlit run client_demo/streamlit_app.py   # terminal 2
+```
+
+Full walkthrough: [`docs/SETUP_MACOS.md`](docs/SETUP_MACOS.md).
+
+### Windows
+
+liboqs needs Visual Studio Build Tools to compile natively, so the server
+runs in Docker (`docker compose up --build`) and only the dashboard runs
+natively (`pip install -r requirements-client.txt`, plaintext channel).
+See [`docs/SETUP.md`](docs/SETUP.md).
+
+## Using the dashboard
+
+| Tab | What you do | Expected result |
+|---|---|---|
+| **Live Capture** | Start a session, press START on the video, then **Record**: look at the camera, then do the challenge shown on the video. Verify. | ✅ ACCEPT for a real, live person |
+| **Simulate Attack** | Pick a pre-made sample (genuine, replay, printed photo, screen replay, morph, deepfake, injection) or upload a file | ❌ REJECT, naming the detector and why |
+| **Tamper with Protocol** | Break one protocol rule on a genuine capture: swapped frames, flipped bit, stale timestamp, reused nonce, wrong answer | ❌ REJECT by the cryptographic layer in about 1 ms |
+
+Each result shows the post-quantum channel used, every binding check, each
+detector's score and verdict, and a **"Why was this rejected?"** list. A
+step-by-step presenter's guide is in [`GUIDE.md`](GUIDE.md).
+
+## Project structure
+
+```
+crypto/         ML-KEM / ML-DSA wrappers (liboqs), AES-256-GCM channel, RSA/ECDSA baseline
+binding/        Transaction binding: signature, nonce, freshness, challenge checks
+detection/      Five detectors, face-region helper, liveness-challenge check, fusion engine
+server/         FastAPI app: sessions, sealed verification pipeline, decision explanations
+client_demo/    Streamlit dashboard, clip recorder, API client
+evaluation/     Benchmark harness (latency, PQC vs classical, throughput), ISO 30107-3 metrics
+scripts/        make_demo_assets.py (demo samples), demo_check.py (self-check)
+tests/          105 unit and API tests
+report/         Final report, figures, raw data, experiment scripts (incl. Qiskit circuits)
+docs/           Architecture, setup guides, study guide, original specification
+datasets/       Download instructions only (datasets are not committed)
+demo_assets/    Generated demo samples (gitignored) and their description
+```
+
+## API
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Status, algorithms, liboqs readiness |
+| `POST /session/start` | New session: nonce, challenge, ML-KEM public key, ML-DSA identity |
+| `POST /session/{id}/evidence` | ML-DSA-sign the binding payload (see Limitations) |
+| `POST /session/{id}/verify-sealed` | Sealed (ML-KEM + AES-256-GCM) submission → binding → AI → decision + explanations |
+| `POST /session/{id}/verify` | Same pipeline for clients without liboqs (plaintext) |
+| `POST /session/{id}/channel` | Server-side ML-KEM round trip, for diagnostics |
+| `POST /demo/reset-replay-store` | Clear replay memory between rehearsals (`DEMO_MODE=true` only) |
+| `DELETE /session/{id}` | Close a session and free its keys |
+
+## Testing and reproducibility
+
+```bash
+pytest tests/ -q                                 # 105 tests; liboqs-dependent ones skip without liboqs
+python scripts/demo_check.py --explain           # 12 attack/genuine scenarios against a running server
+python report/scripts/system_experiments.py      # regenerates the report's tables and figures
+```
+
+The quantum experiments need Qiskit in a separate environment
+(`pip install -r report/requirements-report.txt`); see Appendix A of the report.
+
+## Limitations
+
+- **Detectors are heuristics, not trained models.** Each has a documented
+  path to a pretrained model (MiniFASNet, Meso4;
+  [`detection/README-models.md`](detection/README-models.md)), but none is
+  bundled. They were calibrated on one public-domain portrait, its attack
+  derivatives and simulated webcam conditions. The results show each layer
+  working as designed; they are not accuracy figures on a dataset, and a
+  high-quality print in good light can defeat the presentation-attack cues.
+- **Signing happens in the server process.** The client encrypts the channel
+  itself, but the per-session ML-DSA "client identity" lives on the server,
+  so that a Windows client never needs liboqs. A production client would
+  hold its own key (device or TEE).
+- **Challenges.** Head movements are verified from the recording; spoken
+  numbers are checked by string match (no speech recognition).
+- **In-memory state.** Sessions and replay memory live in one process; a
+  multi-server deployment would need a shared store such as Redis.
+- **Quantum results are simulations** on a parametric noise model, not
+  real quantum hardware.
+
+## Future work
+
+- Plug in pretrained MiniFASNet and Meso4 and measure APCER/BPCER on
+  CelebA-Spoof, FaceForensics++ and AMSL.
+- A trained virtual-camera detector, so injected *still images* are caught
+  too.
+- Sign on the client device or in a TEE, so the private key never leaves the
+  capture device.
+- Hybrid X25519 + ML-KEM-768 key exchange for the transition period.
+- Feed session nonces from a quantum random number generator (with HKDF
+  conditioning), and run the Shor/Grover circuits on IBM Quantum hardware.
+- Speech recognition for spoken-number challenges; Redis-backed state for
+  horizontal scaling.
+
+## Documentation
+
+| Document | For |
+|---|---|
+| [`GUIDE.md`](GUIDE.md) | Presenter's guide: running the demo, showing each ACCEPT/REJECT |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Verification flow, detectors, security properties |
+| [`docs/SETUP_MACOS.md`](docs/SETUP_MACOS.md), [`docs/SETUP.md`](docs/SETUP.md) | Detailed setup (macOS, Windows) |
+| [`docs/STUDY_GUIDE.md`](docs/STUDY_GUIDE.md) | Background: PQC, algorithms, detectors, terminology |
+| [`report/FINAL_REPORT.md`](report/FINAL_REPORT.md) | Full report with quantum circuits, results and references |
+| [`CHANGELOG.md`](CHANGELOG.md), [`CLAUDE.md`](CLAUDE.md) | Change history, contributor conventions |

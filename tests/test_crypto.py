@@ -2,7 +2,7 @@
 round-trip (keygen/encap/decap, sign/verify)").
 
 ML-KEM/ML-DSA tests are skipped (not faked) when liboqs isn't available in
-this environment - see tests/conftest.py and SETUP.md. The classical
+this environment - see tests/conftest.py and docs/SETUP.md. The classical
 baseline tests always run natively since `cryptography` has no such
 dependency.
 """

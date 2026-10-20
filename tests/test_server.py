@@ -23,6 +23,7 @@ from PIL import Image
 
 from conftest import skip_if_no_oqs
 
+from crypto.channel import evidence_hash_of
 from server.main import app
 
 client = TestClient(app)
@@ -38,6 +39,10 @@ def _frame_b64(seed: int = 0) -> str:
     buf = BytesIO()
     Image.fromarray(arr).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _hash_of(*frames_b64: str) -> str:
+    return evidence_hash_of([base64.b64decode(f) for f in frames_b64]).hex()
 
 
 def _challenge_response_for(challenge: str) -> str:
@@ -59,6 +64,15 @@ def test_health_reports_status_without_raising():
     assert body["status"] in {"ok", "degraded"}
     assert "kem_alg" in body and "sig_alg" in body
     assert "liboqs_ready" in body
+
+
+def test_demo_reset_is_refused_outside_demo_mode(monkeypatch):
+    from server.config import settings
+
+    monkeypatch.setattr(settings, "demo_mode", False)
+    assert client.post("/demo/reset-replay-store").status_code == 403
+    monkeypatch.setattr(settings, "demo_mode", True)
+    assert client.post("/demo/reset-replay-store").json() == {"replay_store_cleared": True}
 
 
 @skip_if_no_oqs
@@ -83,7 +97,8 @@ class TestSessionFlow:
         session_id = session["session_id"]
         challenge_response = _challenge_response_for(session["challenge"])
 
-        evidence_hash = "00" * 32
+        frame = _frame_b64(seed=1)
+        evidence_hash = _hash_of(frame)
         timestamp = _now_iso()
         sign_resp = client.post(
             f"/session/{session_id}/evidence",
@@ -99,7 +114,7 @@ class TestSessionFlow:
                 "timestamp": timestamp,
                 "challenge_response": challenge_response,
                 "signature": signature,
-                "frames_b64": [_frame_b64(seed=1)],
+                "frames_b64": [frame],
             },
         )
         assert verify_resp.status_code == 200
@@ -110,7 +125,9 @@ class TestSessionFlow:
             "nonce_unused": True,
             "timestamp_fresh": True,
             "challenge_fulfilled": True,
+            "evidence_matches_hash": True,
         }
+        assert body["channel"] == "plaintext"
         assert body["detection_ran"] is True
         assert set(body["detection_scores"].keys()) == {
             "presentation_attack",
@@ -206,18 +223,19 @@ class TestSessionFlow:
         session_id = session["session_id"]
         challenge_response = _challenge_response_for(session["challenge"])
         timestamp = _now_iso()
+        frame = _frame_b64(seed=2)
 
         sign_resp = client.post(
             f"/session/{session_id}/evidence",
-            json={"evidence_hash": "00" * 32, "timestamp": timestamp, "challenge_response": challenge_response},
+            json={"evidence_hash": _hash_of(frame), "timestamp": timestamp, "challenge_response": challenge_response},
         )
         signature = sign_resp.json()["signature"]
         verify_payload = {
-            "evidence_hash": "00" * 32,
+            "evidence_hash": _hash_of(frame),
             "timestamp": timestamp,
             "challenge_response": challenge_response,
             "signature": signature,
-            "frames_b64": [_frame_b64(seed=2)],
+            "frames_b64": [frame],
         }
 
         first = client.post(f"/session/{session_id}/verify", json=verify_payload)
@@ -231,6 +249,33 @@ class TestSessionFlow:
         assert body["binding_accepted"] is False
         assert body["binding_checks"]["nonce_unused"] is False
         assert body["detection_ran"] is False
+
+    def test_verify_rejects_frames_substituted_after_signing(self):
+        session = client.post("/session/start").json()
+        session_id = session["session_id"]
+        challenge_response = _challenge_response_for(session["challenge"])
+        timestamp = _now_iso()
+        signed_frame, swapped_frame = _frame_b64(seed=3), _frame_b64(seed=4)
+
+        signature = client.post(
+            f"/session/{session_id}/evidence",
+            json={"evidence_hash": _hash_of(signed_frame), "timestamp": timestamp, "challenge_response": challenge_response},
+        ).json()["signature"]
+
+        body = client.post(
+            f"/session/{session_id}/verify",
+            json={
+                "evidence_hash": _hash_of(signed_frame),  # valid signature over the genuine frame...
+                "timestamp": timestamp,
+                "challenge_response": challenge_response,
+                "signature": signature,
+                "frames_b64": [swapped_frame],  # ...but different frames submitted
+            },
+        ).json()
+        assert body["binding_checks"]["signature_valid"] is True
+        assert body["binding_checks"]["evidence_matches_hash"] is False
+        assert body["detection_ran"] is False
+        assert body["accepted"] is False
 
     def test_verify_unknown_session_returns_404(self):
         resp = client.post(
@@ -247,3 +292,61 @@ class TestSessionFlow:
         assert resp.json()["closed"] is True
         # session no longer usable
         assert client.post(f"/session/{session_id}/channel").status_code == 404
+
+
+@skip_if_no_oqs
+class TestSealedChannel:
+    def _sealed_submission(self, session: dict, aad_session_id: str | None = None) -> dict:
+        import json
+
+        from crypto.channel import seal_payload
+        from crypto.kem import client_encapsulate
+
+        session_id = session["session_id"]
+        challenge_response = _challenge_response_for(session["challenge"])
+        timestamp = _now_iso()
+        frame = _frame_b64(seed=5)
+        signature = client.post(
+            f"/session/{session_id}/evidence",
+            json={"evidence_hash": _hash_of(frame), "timestamp": timestamp, "challenge_response": challenge_response},
+        ).json()["signature"]
+        inner = {
+            "evidence_hash": _hash_of(frame),
+            "timestamp": timestamp,
+            "challenge_response": challenge_response,
+            "signature": signature,
+            "frames_b64": [frame],
+        }
+        kem_ct, shared_secret = client_encapsulate(bytes.fromhex(session["kem_public_key"]), alg=session["kem_alg"])
+        aead_nonce, ciphertext = seal_payload(
+            shared_secret, base64.b64decode(session["nonce"]), aad_session_id or session_id, json.dumps(inner).encode()
+        )
+        return {
+            "kem_ciphertext": kem_ct.hex(),
+            "aead_nonce": base64.b64encode(aead_nonce).decode(),
+            "ciphertext": base64.b64encode(ciphertext).decode(),
+        }
+
+    def test_sealed_payload_is_decrypted_and_verified(self):
+        session = client.post("/session/start").json()
+        body = client.post(f"/session/{session['session_id']}/verify-sealed", json=self._sealed_submission(session)).json()
+        assert body["channel"] == "ML-KEM-768 + AES-256-GCM"
+        assert body["binding_accepted"] is True
+        assert body["detection_ran"] is True
+        assert {"kem_decapsulate_ms", "aead_decrypt_ms"} <= set(body["timing_ms"])
+
+    def test_tampered_ciphertext_is_rejected_at_channel(self):
+        session = client.post("/session/start").json()
+        sealed = self._sealed_submission(session)
+        raw = bytearray(base64.b64decode(sealed["ciphertext"]))
+        raw[0] ^= 0x01
+        sealed["ciphertext"] = base64.b64encode(bytes(raw)).decode()
+        body = client.post(f"/session/{session['session_id']}/verify-sealed", json=sealed).json()
+        assert body["binding_checks"] == {"channel_authentic": False}
+        assert body["accepted"] is False
+
+    def test_payload_sealed_for_another_session_is_rejected(self):
+        session = client.post("/session/start").json()
+        sealed = self._sealed_submission(session, aad_session_id="some-other-session")
+        body = client.post(f"/session/{session['session_id']}/verify-sealed", json=sealed).json()
+        assert body["binding_checks"] == {"channel_authentic": False}

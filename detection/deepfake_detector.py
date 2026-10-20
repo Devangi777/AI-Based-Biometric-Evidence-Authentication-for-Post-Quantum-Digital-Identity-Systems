@@ -111,11 +111,12 @@ class DeepfakeDetector:
         if not frames:
             raise ValueError("predict_video requires at least one frame")
         results = [self.predict(f) for f in frames]
+        worst = min(results, key=lambda r: r.score)
         return DetectionResult(
             module=self.module_name,
-            score=min(r.score for r in results),
+            score=worst.score,
             is_mock=results[0].is_mock,
-            details={"num_frames": len(results), "per_frame_scores": [r.score for r in results]},
+            details={**worst.details, "num_frames": len(results), "per_frame_scores": [r.score for r in results]},
         )
 
     def _predict_mock(self, frame: np.ndarray) -> DetectionResult:

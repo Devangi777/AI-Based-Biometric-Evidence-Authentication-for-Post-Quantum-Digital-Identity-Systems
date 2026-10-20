@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Persistent conventions for this repo. Read `PQ-Biometric-Auth-Spec.md` first
+Persistent conventions for this repo. Read `docs/PQ-Biometric-Auth-Spec.md` first
 for the actual architecture/design; this file is process rules, not design
 docs.
 
@@ -40,7 +40,7 @@ docs.
 - **`tests/conftest.py`'s `skip_if_no_oqs` marker** gates every test that
   needs a real ML-KEM/ML-DSA keypair. It's a test-environment convenience,
   not a design decision about the production code path - the production
-  code always uses real liboqs (see SETUP.md for the Docker/WSL2 path that
+  code always uses real liboqs (see docs/SETUP.md for the Docker/WSL2 path that
   makes it available). When adding a new PQC-dependent test, mark it with
   this rather than letting the whole test *file* fail to collect.
 - **Detection modules default to `DETECTION_MODE=pretrained`, but silently
@@ -54,19 +54,36 @@ docs.
   genuine, for every module and the fused score (`detection/base.py`,
   `detection/fusion.py`). Keep new detectors on this same scale so
   `.env`'s per-module thresholds and the fusion weights stay meaningful.
-- **`server/main.py`'s `/session/{id}/verify` is a short-circuit pipeline**:
-  Section 7 transaction-binding checks run first, and AI detection only
-  runs (frames are even required) if binding fully passes. Don't
+- **`server/main.py`'s `_verify_core` is a short-circuit pipeline** (behind
+  both `/verify` and `/verify-sealed`): the sealed channel must authenticate,
+  then the Section 7 transaction-binding checks run (including
+  `evidence_matches_hash`: the received frames must hash, via
+  `crypto/channel.py: evidence_hash_of`, to the signed `evidence_hash`), and
+  AI detection only runs (frames are even required) if all of them pass. Don't
   restructure this to run detection unconditionally - it's both spec-
   mandated (Section 7 step 7) and a real latency optimization since a
   binding-rejected request never needs to touch the 5 detectors.
-- **Both "client" and "server" PQC roles run in the one Dockerized
-  process** in this prototype (see `README.md` "Assumptions" #2) - the
-  Streamlit demo has no native liboqs build available on Windows. If a real
-  separate client is ever added, `crypto/kem.py`/`crypto/signature.py` are
-  already written with no assumption about which process calls them, so
-  that should be a caller-side change, not a rewrite of those modules.
-- **CRLF line endings**: git on this checkout normalizes to CRLF on commit
-  (Windows default) - the `warning: LF will be replaced by CRLF` messages
-  during `git add`/`git commit` are expected and harmless, not something to
-  "fix."
+- **ML-DSA signing runs in the server process; ML-KEM sealing runs in the
+  client when it can** (see `README.md` "Assumptions" #2). The client
+  (`client_demo/api_client.py: run_verification`) encapsulates and seals
+  with AES-256-GCM via `crypto/channel.py` if `oqs` imports, else falls back
+  to plaintext `/verify`. `crypto/kem.py`/`crypto/signature.py`/
+  `crypto/channel.py` make no assumption about which process calls them, so
+  moving signing to a real client is a caller-side change.
+- **Demo samples and the self-check share one scenario list.**
+  `scripts/make_demo_assets.py` builds `demo_assets/attacks/` (gitignored);
+  `scripts/demo_check.py: SCENARIOS` is also imported by
+  `report/scripts/system_experiments.py`, so the report's Table 10 and the
+  pre-demo check cannot drift apart. If a detector change alters a scenario's
+  outcome, rerun both and update the report.
+- **Live Capture records over WebRTC** (`client_demo/recorder.py`). The
+  frame callback runs in streamlit-webrtc's worker thread: it may only touch
+  the `ClipRecorder` object, never `st.session_state` (that was the original
+  live-capture bug).
+- **Every decision is explained** by `server/explain.py`. When a detector's
+  details or thresholds change, update its explanation text (it quotes the
+  measured values and live-vs-attack reference ranges) and
+  `tests/test_explain.py`.
+- **Calibrate detectors on real faces, not noise.** Uniform random noise
+  looks like a GAN to the FFT deepfake heuristic; use natural-statistics
+  frames or face-derived samples when testing detector changes.

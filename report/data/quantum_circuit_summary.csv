@@ -1,0 +1,4 @@
+circuit,qubits,clbits,logical_depth,transpiled_depth,cx_count,single_qubit_gates,success_ideal,success_noisy_p2_1pct
+shor_N15,8,4,183,1573,792,1342,0.4991455078125,0.1322021484375
+grover_4q,4,4,182,174,84,160,0.960205078125,0.4300537109375
+qrng_8q,8,8,2,4,0,24,0.9124450352323635,0.9124450352323635

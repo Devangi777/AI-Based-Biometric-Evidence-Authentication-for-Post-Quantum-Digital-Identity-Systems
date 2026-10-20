@@ -35,21 +35,39 @@ _MOTION_THRESHOLD_FRACTION_OF_FACE_WIDTH = 0.06
 
 
 def verify_challenge(challenge: str, challenge_response: str, frames: list[np.ndarray] | None = None) -> bool:
+    return evaluate_challenge(challenge, challenge_response, frames)[0]
+
+
+def evaluate_challenge(
+    challenge: str, challenge_response: str, frames: list[np.ndarray] | None = None
+) -> tuple[bool, dict]:
+    """Like verify_challenge, plus what was measured, so a rejection can be
+    explained (e.g. how far the head actually moved)."""
     challenge_lower = (challenge or "").lower()
 
     if "say the number" in challenge_lower:
         expected = _DIGITS_RE.search(challenge)
         given = _DIGITS_RE.search(challenge_response or "")
-        return bool(expected and given and expected.group() == given.group())
+        ok = bool(expected and given and expected.group() == given.group())
+        return ok, {
+            "kind": "number",
+            "expected": expected.group() if expected else None,
+            "given": given.group() if given else None,
+        }
 
     if frames and len(frames) >= 2 and ("turn" in challenge_lower or "nod" in challenge_lower):
         motion = _max_landmark_motion(frames)
         if motion is not None:
-            return motion >= _MOTION_THRESHOLD_FRACTION_OF_FACE_WIDTH
+            return motion >= _MOTION_THRESHOLD_FRACTION_OF_FACE_WIDTH, {
+                "kind": "movement",
+                "motion": motion,
+                "required": _MOTION_THRESHOLD_FRACTION_OF_FACE_WIDTH,
+            }
 
     # Fallback: no frames, MediaPipe unavailable, or an unrecognized
     # challenge type - can only check that some response was submitted.
-    return bool(challenge_response and challenge_response.strip())
+    ok = bool(challenge_response and challenge_response.strip())
+    return ok, {"kind": "response_only", "frames": len(frames or [])}
 
 
 def _max_landmark_motion(frames: list[np.ndarray]) -> float | None:

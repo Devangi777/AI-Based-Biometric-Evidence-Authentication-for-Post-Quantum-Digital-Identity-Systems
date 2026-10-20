@@ -12,12 +12,23 @@ meaningless scores, which is worse than being explicit about the gap). So
 `mode="mock"` in this environment - this is the "documented fallback/mock
 mode" the build instructions call for, not a permanent design choice.
 
-Mock-mode heuristic: classic pre-deep-learning liveness proxies that need no
-trained model - Laplacian-variance sharpness (screen/print recaptures are
-typically softer than a live camera capture) and RGB channel diversity
-(prints/screens often have a narrower color gamut). This is a much weaker
-signal than a real trained PAD model; it exists purely so the pipeline is
-exercisable end-to-end without downloads.
+Mock-mode heuristic: three classic recapture cues, measured on the face
+region (MediaPipe box, or the central crop without MediaPipe):
+
+- Black level (weight 0.5): the darkest 1% of face-region pixels. A live
+  face always has true blacks (pupils, nostrils, hair); paper and screens
+  cannot reproduce them, because of ink/backlight reflectance and glare.
+  Live webcam frames measured 0-2; recaptured prints/screens 50-62.
+- Sharpness (0.3): Laplacian variance at a fixed 160 px face width. Prints
+  lose detail and a phone/photo held close to a fixed-focus webcam is out
+  of focus. Live webcam faces measured 26-109; a printed photo 7.
+- Saturation (0.2): mean HSV saturation of the face. Recaptures look
+  washed out. Kept low-weight because it also varies with skin tone and
+  lighting.
+
+A previous version scored whole-frame sharpness / 500, a scale only a sharp
+still photo reaches; real webcam frames (15-50) were all rejected.
+This is still a much weaker signal than a trained PAD model.
 """
 from __future__ import annotations
 
@@ -28,10 +39,23 @@ import numpy as np
 from PIL import Image
 
 from detection.base import DetectionResult, clip01
+from detection.face_region import FaceRegionFinder
 
 logger = logging.getLogger(__name__)
 
 WEIGHTS_PATH = Path(__file__).parent / "weights" / "pad_minifasnet.pth"
+
+_FACE_WIDTH = 160  # face region is resized to this width before measuring sharpness
+# (attack-like, live-like) ramps for each cue
+_BLACK_LEVEL_RAMP = (40.0, 15.0)  # 1st-percentile face luminance, 0-255
+_SHARPNESS_RAMP = (np.log10(8.0), np.log10(25.0))  # log10 Laplacian variance
+_SATURATION_RAMP = (45.0, 75.0)  # mean HSV saturation, 0-255
+_WEIGHTS = {"black_level": 0.5, "sharpness": 0.3, "saturation": 0.2}
+
+
+def _ramp(x: float, attack_live: tuple[float, float]) -> float:
+    attack, live = attack_live
+    return clip01((x - attack) / (live - attack))
 
 
 class PresentationAttackDetector:
@@ -41,6 +65,8 @@ class PresentationAttackDetector:
         self.device = device
         self.mode = mode
         self._model = None
+        # `mode="mock"` also skips MediaPipe face cropping (central crop only).
+        self._faces = FaceRegionFinder(use_mediapipe=mode != "mock", owner="PAD")
         if self.mode == "pretrained":
             self._model = self._try_load_model()
             if self._model is None:
@@ -66,26 +92,37 @@ class PresentationAttackDetector:
         return self._predict_pretrained(frame)  # pragma: no cover - unreachable until a model is wired in
 
     def _predict_mock(self, frame: np.ndarray) -> DetectionResult:
-        gray = np.asarray(Image.fromarray(frame).convert("L"), dtype=np.float64)
+        region, crop_details = self._faces.crop(np.asarray(Image.fromarray(frame).convert("RGB")))
+        face = Image.fromarray(region)
 
-        # Manual 3x3 Laplacian (avoids an OpenCV/scipy dependency for the
-        # mock path - detection/README-models.md documents the real filters
-        # a pretrained model would learn instead of this proxy).
+        luminance = np.asarray(face.convert("L"), dtype=np.float64)
+        black_level = float(np.percentile(luminance, 1))
+
+        height = max(8, round(face.height * _FACE_WIDTH / face.width))
+        gray = np.asarray(face.convert("L").resize((_FACE_WIDTH, height), Image.BILINEAR), dtype=np.float64)
+        # Manual 3x3 Laplacian (no OpenCV/scipy dependency in the mock path).
         lap = -4 * gray[1:-1, 1:-1] + gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:]
         sharpness = float(lap.var()) if lap.size else 0.0
 
-        rgb = np.asarray(frame, dtype=np.float64)
-        channel_std = float(rgb.reshape(-1, rgb.shape[-1]).std(axis=0).mean()) if rgb.ndim == 3 else 0.0
+        saturation = float(np.asarray(face.convert("HSV"), dtype=np.float64)[..., 1].mean())
 
-        sharpness_score = clip01(sharpness / 500.0)
-        color_score = clip01(channel_std / 60.0)
-        score = clip01(0.6 * sharpness_score + 0.4 * color_score)
+        cues = {
+            "black_level": _ramp(black_level, _BLACK_LEVEL_RAMP),
+            "sharpness": _ramp(np.log10(max(sharpness, 1e-6)), _SHARPNESS_RAMP),
+            "saturation": _ramp(saturation, _SATURATION_RAMP),
+        }
+        score = sum(_WEIGHTS[k] * v for k, v in cues.items())
 
         return DetectionResult(
             module=self.module_name,
             score=score,
             is_mock=True,
-            details={"sharpness": sharpness, "channel_std": channel_std},
+            details={
+                "face_black_level": black_level,
+                "face_sharpness": sharpness,
+                "face_saturation": saturation,
+                **crop_details,
+            },
         )
 
     def _predict_pretrained(self, frame: np.ndarray) -> DetectionResult:  # pragma: no cover

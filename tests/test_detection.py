@@ -22,6 +22,23 @@ def _synthetic_frame(rng: np.random.Generator, sharp: bool = True) -> np.ndarray
     return frame
 
 
+def _natural_frame(rng: np.random.Generator, size: int = 240) -> np.ndarray:
+    """1/f-spectrum texture (natural-image statistics) as float64."""
+    fy, fx = np.fft.fftfreq(size)[:, None], np.fft.fftfreq(size)[None, :]
+    f = np.hypot(fy, fx)
+    f[0, 0] = 1
+    chans = []
+    for _ in range(3):
+        img = np.real(np.fft.ifft2((rng.normal(size=(size, size)) + 1j * rng.normal(size=(size, size))) / f**1.2))
+        chans.append((img - img.mean()) / img.std() * 45 + 128)
+    return np.clip(np.stack(chans, -1) + rng.normal(0, 4, (size, size, 3)), 0, 255)
+
+
+def _live_camera_timestamps(rng: np.random.Generator, n: int = 10) -> list[float]:
+    """~30 fps with a few percent scheduling jitter, like a real webcam."""
+    return list(np.cumsum(np.r_[0.0, rng.normal(1 / 30, 0.0017, n - 1)]))
+
+
 def test_clip01_bounds():
     assert clip01(-5) == 0.0
     assert clip01(5) == 1.0
@@ -80,6 +97,20 @@ class TestMorphDetector:
         frame = np.concatenate([left_half, left_half[:, ::-1]], axis=1)
         result = detector.predict(frame)
         assert 0.0 <= result.score <= 1.0
+
+    def test_blend_artifacts_score_lower_than_single_capture(self):
+        """Ghosting (offset blend) and mirror-symmetric fine detail (blend
+        with a mirrored identity) are both flagged; a single capture is not."""
+        from detection.morph_detector import MorphDetector
+
+        detector = MorphDetector(mode="mock")
+        face = _natural_frame(np.random.default_rng(4))
+        ghosted = (0.5 * face + 0.5 * np.roll(face, 12, axis=1)).astype(np.uint8)
+        mirrored = (0.5 * face + 0.5 * face[:, ::-1]).astype(np.uint8)
+        genuine = detector.predict(face.astype(np.uint8))
+        assert genuine.score > 0.9
+        assert detector.predict(ghosted).score < 0.5
+        assert detector.predict(mirrored).score < 0.5
 
 
 class TestDeepfakeDetector:
@@ -149,6 +180,53 @@ class TestReplayDetector:
         result = detector.check_and_record(_synthetic_frame(rng), session_id="s2")
         assert result.score > 0.0
 
+    def test_non_matching_capture_never_trips_the_veto(self):
+        """Anything farther than the Hamming threshold must stay >= 0.5 (the
+        fusion engine's per-module veto), so unrelated captures that happen
+        to be ~10-20 bits apart are not rejected as replays."""
+        from detection.replay_detector import ReplayDetector
+
+        detector = ReplayDetector()
+        rng = np.random.default_rng(10)
+        base = _synthetic_frame(rng)
+        detector.check_and_record(base, session_id="s1")
+        near_miss = base.copy()
+        near_miss[:100] = _synthetic_frame(rng)[:100]  # half the image differs
+        result = detector.check_and_record(near_miss, session_id="s2")
+        assert result.details["best_match_hamming_distance"] > detector.hamming_threshold
+        assert result.score >= 0.5
+
+    def test_new_capture_of_the_same_scene_is_not_a_replay(self):
+        """Two genuine recordings of the same person in the same spot match on
+        pHash; the fine-detail check must tell them apart from a resend."""
+        import io
+
+        from PIL import Image
+
+        from detection.replay_detector import ReplayDetector
+
+        def camera(img: np.ndarray, quality: int = 75) -> np.ndarray:
+            """Frames arrive already compressed (webcam/browser JPEG or VP8)."""
+            buf = io.BytesIO()
+            Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)).save(buf, format="JPEG", quality=quality)
+            return np.asarray(Image.open(io.BytesIO(buf.getvalue())).convert("RGB"))
+
+        rng = np.random.default_rng(11)
+        scene = _natural_frame(rng)
+        first = camera(scene + rng.normal(0, 3, scene.shape))
+        # same person, a few pixels over, fresh sensor noise
+        second = camera(np.roll(scene, 3, axis=1) + rng.normal(0, 3, scene.shape))
+
+        detector = ReplayDetector()
+        detector.check_and_record(first, session_id="s1")
+        result = detector.check_and_record(second, session_id="s2")
+        assert result.details["best_match_hamming_distance"] <= detector.hamming_threshold
+        assert result.details["same_scene_new_capture"] is True
+        assert result.score >= 0.5
+
+        resent = camera(first, quality=85)  # the first capture sent again, re-encoded on the way
+        assert detector.check_and_record(resent, session_id="s3").score == 0.0
+
     def test_clear_resets_store(self):
         from detection.replay_detector import ReplayDetector
 
@@ -193,8 +271,33 @@ class TestInjectionDetector:
         rng = np.random.default_rng(12)
         detector = InjectionDetector(mode="mock")
         frame = _synthetic_frame(rng)
-        steady = [i / 30.0 for i in range(10)]
+        live = _live_camera_timestamps(rng)
         erratic = [0, 0.01, 0.5, 0.51, 2.0, 2.02, 2.5, 5.0, 5.01, 5.5]
-        steady_result = detector.predict(frame, frame_timestamps=steady)
+        live_result = detector.predict(frame, frame_timestamps=live)
         erratic_result = detector.predict(frame, frame_timestamps=erratic)
-        assert erratic_result.score < steady_result.score
+        assert erratic_result.score < live_result.score
+
+    def test_exactly_regular_timestamps_are_penalized(self):
+        """Timestamps synthesized from a file's nominal fps (pre-recorded
+        or virtual-camera stream) have zero jitter; a live camera does not."""
+        from detection.injection_detector import InjectionDetector
+
+        rng = np.random.default_rng(13)
+        detector = InjectionDetector(mode="mock")
+        timing_regular, _ = detector._frame_timing_heuristic([i / 30.0 for i in range(10)])
+        timing_live, _ = detector._frame_timing_heuristic(_live_camera_timestamps(rng))
+        assert timing_regular == 0.0
+        assert timing_live == 1.0
+
+
+def test_short_sequences_are_not_judged_on_timing():
+    """A handful of intervals can't tell a camera from a file (live jitter
+    reads as "machine-perfect" by chance), so timing needs >= 8 intervals."""
+    from detection.injection_detector import InjectionDetector
+
+    detector = InjectionDetector(mode="mock")
+    for seed in range(50):
+        score, details = detector._frame_timing_heuristic(_live_camera_timestamps(np.random.default_rng(seed), n=5))
+        assert score == 1.0 and details["timing_checked"] is False
+    _, details = detector._frame_timing_heuristic(_live_camera_timestamps(np.random.default_rng(0), n=9))
+    assert details["timing_checked"] is True

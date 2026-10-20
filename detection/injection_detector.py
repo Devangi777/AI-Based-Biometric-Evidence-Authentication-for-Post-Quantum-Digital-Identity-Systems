@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 
 WEIGHTS_PATH = Path(__file__).parent / "weights" / "injection_cnn.pth"
 
+# Frame-interval jitter bands for a live camera feed. Jitter is a robust
+# coefficient of variation (1.4826 * MAD / median interval), so a few late
+# or dropped frames in an otherwise steady live stream don't dominate it.
+_MIN_LIVE_JITTER = 0.002  # at or below: synthetic, exactly regular timestamps
+_FULL_CREDIT_JITTER = 0.02
+_MAX_LIVE_JITTER = 0.35  # above: increasingly erratic, reaching 0 at 1.0
+_MIN_TIMING_INTERVALS = 8
+
 
 class InjectionDetector:
     module_name = "injection"
@@ -102,18 +110,28 @@ class InjectionDetector:
         return score, {"block_boundary_energy_ratio": block_ratio}
 
     def _frame_timing_heuristic(self, frame_timestamps: list[float] | None) -> tuple[float, dict]:
-        if not frame_timestamps or len(frame_timestamps) < 3:
+        # With only a handful of intervals, live jitter can read as "machine-
+        # perfect" by chance (~2% of 4-interval live sequences did), so
+        # timing is only judged on longer sequences. Live recordings send
+        # every frame's timestamp (~100+); video files send all of theirs.
+        if not frame_timestamps or len(frame_timestamps) < _MIN_TIMING_INTERVALS + 1:
             return 1.0, {"timing_checked": False}
 
         intervals = np.diff(frame_timestamps)
-        if intervals.size == 0 or intervals.mean() <= 0:
+        median = float(np.median(intervals))
+        if median <= 0:
             return 1.0, {"timing_checked": False}
 
-        jitter_ratio = float(intervals.std() / intervals.mean())
+        jitter_ratio = float(1.4826 * np.median(np.abs(intervals - median)) / median)
 
-        # Real camera capture typically has some jitter (device/driver
-        # scheduling); both near-zero jitter (suspiciously exact,
-        # consistent with a synthetic/injected source) and very high jitter
-        # (dropped/duplicated frames from a virtual camera) are penalized.
-        score = clip01(1.0 - abs(jitter_ratio - 0.05) / 0.20)
+        # Real camera capture has some scheduling jitter (typically a few
+        # percent of the frame interval). Both ends are penalized:
+        #  - near-zero jitter: timestamps synthesized from a container's
+        #    nominal fps (a pre-recorded file or virtual camera) are exact.
+        #    The previous symmetric curve still gave jitter 0 a score of
+        #    0.75, so injected streams passed; this ramp gives it 0.
+        #  - very high jitter: dropped/duplicated frames from a virtual camera.
+        low_side = (jitter_ratio - _MIN_LIVE_JITTER) / (_FULL_CREDIT_JITTER - _MIN_LIVE_JITTER)
+        high_side = 1.0 - (jitter_ratio - _MAX_LIVE_JITTER) / (1.0 - _MAX_LIVE_JITTER)
+        score = clip01(min(low_side, high_side))
         return score, {"timing_checked": True, "frame_interval_jitter_ratio": jitter_ratio}

@@ -2,7 +2,7 @@
 #
 # Built on Debian slim + the full liboqs build toolchain (cmake, ninja, gcc)
 # so that `pip install liboqs-python` can compile the native liboqs C library
-# on first import, per Section 11 of PQ-Biometric-Auth-Spec.md. This is the
+# on first import, per Section 11 of docs/PQ-Biometric-Auth-Spec.md. This is the
 # split-architecture fallback used because that build reliably fails on
 # native Windows without Visual Studio Build Tools.
 FROM python:3.11-slim AS base

@@ -1,15 +1,19 @@
 # ---------------------------------------------------------------------------
 # Client-demo dependencies (client_demo/streamlit_app.py only).
 #
-# Runs NATIVELY on Windows Python (not in Docker) because webcam access via
-# streamlit-webrtc is simplest directly on the host OS. This process talks to
-# the Dockerized FastAPI server over HTTP at API_BASE_URL (see .env.example).
-# It does NOT need liboqs-python - all PQC operations happen server-side in
-# this prototype (see README.md "Assumptions" for why).
+# Runs natively on the host OS and talks to the FastAPI server over HTTP at
+# API_BASE_URL (see .env.example). The camera is read in the browser and
+# streamed to this process over WebRTC (streamlit-webrtc) to record the
+# liveness clip; st.camera_input is the two-photo fallback.
 #
-# Install into a native Windows venv:
+# liboqs-python is OPTIONAL here. If it is importable (e.g. macOS/Linux with
+# requirements.txt installed in the same venv), the client runs ML-KEM itself
+# and sends evidence over the sealed ML-KEM + AES-256-GCM channel
+# (/verify-sealed). Without it (typical native Windows, see docs/SETUP.md)
+# the client falls back to the plaintext /verify endpoint.
+#
 #   python -m venv .venv
-#   .venv\Scripts\activate
+#   source .venv/bin/activate        # Windows: .venv\Scripts\activate
 #   pip install -r requirements-client.txt
 # ---------------------------------------------------------------------------
 
@@ -22,3 +26,4 @@ numpy==1.26.4
 requests==2.32.3
 python-dotenv==1.0.1
 pandas==2.2.3
+cryptography==44.0.0

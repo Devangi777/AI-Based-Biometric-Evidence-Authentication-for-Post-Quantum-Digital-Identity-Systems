@@ -12,12 +12,12 @@ Produces the required results as CSV + basic charts under evaluation/results/
      into the CSV header comment.
   4. Throughput (verifications/sec vs. concurrent sessions) against a
      running server - skipped with a clear message if the server (Docker,
-     per SETUP.md) isn't reachable, rather than failing the whole run.
+     per docs/SETUP.md) isn't reachable, rather than failing the whole run.
   5. CPU/memory overhead (process-level, via psutil) during the crypto and
      detection benchmarks.
 
 Run: `python -m evaluation.benchmark` (from the repo root, with either the
-native venv per SETUP.md Step 1, or `docker compose exec server python -m
+native venv per docs/SETUP.md Step 1, or `docker compose exec server python -m
 evaluation.benchmark`).
 """
 from __future__ import annotations
@@ -76,8 +76,25 @@ def _process_snapshot() -> dict:
     return {"cpu_user_s": cpu_times.user, "cpu_system_s": cpu_times.system, "rss_bytes": mem.rss}
 
 
-def _synthetic_frame(rng: np.random.Generator) -> np.ndarray:
-    return rng.integers(0, 256, size=(200, 200, 3), dtype=np.uint8)
+def _synthetic_frame(rng: np.random.Generator, size: int = 200) -> np.ndarray:
+    """Stand-in for a camera frame with natural-image statistics: a
+    1/f^1.2 amplitude-spectrum luminance with correlated colour channels,
+    plus mild sensor noise. (Uniform
+    white noise is NOT a valid "genuine" proxy - its flat spectrum is exactly
+    what the deepfake detector's FFT heuristic flags as GAN upsampling.)"""
+    fy, fx = np.fft.fftfreq(size)[:, None], np.fft.fftfreq(size)[None, :]
+    f = np.hypot(fy, fx)
+    f[0, 0] = 1
+
+    def texture(scale: float) -> np.ndarray:
+        img = np.real(np.fft.ifft2((rng.normal(size=(size, size)) + 1j * rng.normal(size=(size, size))) / f**1.2))
+        return (img - img.mean()) / img.std() * scale
+
+    # Shared luminance (light and shadow, including near-black) plus smaller
+    # per-channel colour variation, as in real camera images.
+    luminance = texture(60) + 120
+    frame = np.stack([luminance + texture(18) for _ in range(3)], axis=-1) + rng.normal(0, 4, (size, size, 3))
+    return frame.clip(0, 255).astype(np.uint8)
 
 
 def _write_csv(rows: list[dict], path: Path) -> None:
@@ -143,7 +160,7 @@ def benchmark_crypto(n: int = 30) -> list[dict]:
         rows.append({"op": "ML-KEM-768.ciphertext_bytes", "n": 1, "mean_ms": kd.get("length_ciphertext", 0), "median_ms": 0, "stdev_ms": 0, "min_ms": 0, "max_ms": 0})
         rows.append({"op": "ML-DSA-65.signature_bytes", "n": 1, "mean_ms": sd.get("length_signature", 0), "median_ms": 0, "stdev_ms": 0, "min_ms": 0, "max_ms": 0})
     except Exception as exc:
-        logger.warning("Skipping PQC benchmarks - liboqs unavailable in this environment (%s). See SETUP.md.", exc)
+        logger.warning("Skipping PQC benchmarks - liboqs unavailable in this environment (%s). See docs/SETUP.md.", exc)
 
     from crypto import classical_baseline
 
@@ -216,12 +233,12 @@ def benchmark_detection(n: int = 10) -> tuple[list[dict], list[dict]]:
 
     latency_rows.append({"module": "replay", **asdict(_time_it(_replay_check, n))})
 
-    # Caveated pseudo-accuracy: synthetic "genuine" frames (random noise,
-    # matching the mock heuristics' calibration target) vs. a crude
-    # synthetic "attack" proxy (flat/low-variance frames, standing in for a
-    # blurry recapture). This is a pipeline smoke test, NOT a meaningful
-    # detection-accuracy number - see detection/README-models.md and the
-    # printed warning in main().
+    # Caveated pseudo-accuracy: synthetic "genuine" frames (natural-image
+    # statistics, see _synthetic_frame) vs. a crude synthetic "attack" proxy
+    # (flat/low-variance frames, standing in for a blurry recapture). This is
+    # a pipeline smoke test, NOT a meaningful detection-accuracy number - see
+    # detection/README-models.md, scripts/demo_check.py for per-attack
+    # behaviour on face-derived samples, and the printed warning in main().
     accuracy_rows = []
     genuine_frames = [_synthetic_frame(rng) for _ in range(8)]
     attack_frames = [np.full((200, 200, 3), 128, dtype=np.uint8) for _ in range(8)]
@@ -264,7 +281,7 @@ def benchmark_throughput(base_url: str = "http://localhost:8000", concurrency_le
     try:
         httpx.get(f"{base_url}/health", timeout=5)
     except Exception as exc:
-        logger.warning("Skipping throughput benchmark - server unreachable at %s (%s). Start it per SETUP.md.", base_url, exc)
+        logger.warning("Skipping throughput benchmark - server unreachable at %s (%s). Start it per docs/SETUP.md.", base_url, exc)
         return []
 
     rows = []
@@ -378,7 +395,7 @@ def main() -> None:
 
     print(
         "NOTE: detection accuracy numbers below use synthetic placeholder "
-        "samples (random noise vs. flat frames), not a labeled research "
+        "samples (natural-statistics textures vs. flat frames), not a labeled research "
         "dataset - they exercise the pipeline end-to-end, they are NOT a "
         "real accuracy result. See detection/README-models.md."
     )

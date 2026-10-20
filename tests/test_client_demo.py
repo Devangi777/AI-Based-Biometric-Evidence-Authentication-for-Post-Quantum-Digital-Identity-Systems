@@ -67,3 +67,50 @@ def test_load_attack_file_dispatches_by_suffix(tmp_path):
 
     with pytest.raises(ValueError):
         load_attack_file(tmp_path / "unsupported.txt")
+
+
+def test_quality_check_rejects_dark_and_blurry_frames():
+    from client_demo.frame_utils import quality_check
+
+    rng = np.random.default_rng(2)
+    textured = rng.integers(40, 220, size=(240, 320, 3), dtype=np.uint8)
+    assert quality_check(textured) == (True, "ok")
+    assert quality_check(np.full((240, 320, 3), 10, dtype=np.uint8))[0] is False  # too dark
+    assert quality_check(np.full((240, 320, 3), 128, dtype=np.uint8))[0] is False  # no detail at all
+
+
+def test_challenge_answer_matches_liveness_verifier():
+    from client_demo.api_client import challenge_answer
+    from detection.liveness_challenge import verify_challenge
+
+    for challenge in ("Say the number 4821", "Turn your head slightly left", "Nod your head once"):
+        assert verify_challenge(challenge, challenge_answer(challenge))
+    assert not verify_challenge("Say the number 4821", "1234")
+
+
+def test_clip_recorder_records_only_inside_its_window_and_overlays_preview():
+    from client_demo.recorder import ClipRecorder
+
+    rec = ClipRecorder()
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+    assert rec.on_frame(frame, now=99.0) is frame  # not recording: preview untouched
+
+    rec.start("Turn your head slightly left", seconds=1.0, now=100.0)
+    previews = [rec.on_frame(frame, now=100.0 + i / 30) for i in range(45)]  # 1.5 s of frames at 30 fps
+    frames, timestamps = rec.take()
+
+    assert len(frames) == 30  # only frames inside the 1 s window
+    assert timestamps[0] == 100.0 and timestamps[-1] < 101.0
+    assert previews[0].any()  # REC overlay drawn while recording
+    assert previews[-1] is frame  # recording over: preview untouched again
+    assert not rec.is_recording(now=101.5)
+
+
+def test_sample_frames_keeps_first_and_last():
+    from client_demo.recorder import sample_frames
+
+    frames = [np.full((2, 2, 3), i, dtype=np.uint8) for i in range(90)]
+    picked = sample_frames(frames, n=8)
+    assert len(picked) == 8
+    assert picked[0][0, 0, 0] == 0 and picked[-1][0, 0, 0] == 89
+    assert sample_frames(frames[:5], n=8) == frames[:5]

@@ -6,12 +6,12 @@
 # wheel for the C library itself. On native Windows this build step commonly
 # fails unless Visual Studio Build Tools + CMake + Ninja are installed.
 #
-# Per SETUP.md / README.md Section "Windows Setup Strategy", this file is
+# Per docs/SETUP.md / README.md Section "Windows Setup Strategy", this file is
 # intended to be installed INSIDE the Docker Linux container (see
 # docker-compose.yml, Dockerfile), where the build toolchain is provisioned
 # automatically and liboqs compiles cleanly. If you have already verified
 # `pip install liboqs-python && python -c "import oqs"` works natively on
-# your machine, you may install this file natively instead - see SETUP.md
+# your machine, you may install this file natively instead - see docs/SETUP.md
 # Section 1 ("try the pip wheel first").
 #
 # The Streamlit demo client (client_demo/) is intentionally NOT in this file;

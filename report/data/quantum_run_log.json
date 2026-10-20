@@ -1,0 +1,141 @@
+{
+  "stats": {
+    "shor_N15": {
+      "qubits": 8,
+      "clbits": 4,
+      "logical_depth": 183,
+      "transpiled_depth": 1573,
+      "cx_count": 792,
+      "single_qubit_gates": 1342
+    },
+    "grover_4q": {
+      "qubits": 4,
+      "clbits": 4,
+      "logical_depth": 182,
+      "transpiled_depth": 174,
+      "cx_count": 84,
+      "single_qubit_gates": 160
+    },
+    "qrng_8q": {
+      "qubits": 8,
+      "clbits": 8,
+      "logical_depth": 2,
+      "transpiled_depth": 4,
+      "cx_count": 0,
+      "single_qubit_gates": 24
+    }
+  },
+  "summary": [
+    {
+      "circuit": "shor_N15",
+      "qubits": 8,
+      "clbits": 4,
+      "logical_depth": 183,
+      "transpiled_depth": 1573,
+      "cx_count": 792,
+      "single_qubit_gates": 1342,
+      "success_ideal": 0.4991455078125,
+      "success_noisy_p2_1pct": 0.1322021484375
+    },
+    {
+      "circuit": "grover_4q",
+      "qubits": 4,
+      "clbits": 4,
+      "logical_depth": 182,
+      "transpiled_depth": 174,
+      "cx_count": 84,
+      "single_qubit_gates": 160,
+      "success_ideal": 0.960205078125,
+      "success_noisy_p2_1pct": 0.4300537109375
+    },
+    {
+      "circuit": "qrng_8q",
+      "qubits": 8,
+      "clbits": 8,
+      "logical_depth": 2,
+      "transpiled_depth": 4,
+      "cx_count": 0,
+      "single_qubit_gates": 24,
+      "success_ideal": 0.9124450352323635,
+      "success_noisy_p2_1pct": 0.9124450352323635
+    }
+  ],
+  "sweep": [
+    {
+      "p2": 0.0,
+      "shor_success": 0.4991455078125,
+      "grover_success": 0.960205078125,
+      "qrng_min_entropy_per_bit": 0.9124450352323635,
+      "qrng_bit_bias_p1": 0.4975738525390625
+    },
+    {
+      "p2": 0.001,
+      "shor_success": 0.3448486328125,
+      "grover_success": 0.88037109375,
+      "qrng_min_entropy_per_bit": 0.9195179762781595,
+      "qrng_bit_bias_p1": 0.4993133544921875
+    },
+    {
+      "p2": 0.0025,
+      "shor_success": 0.2401123046875,
+      "grover_success": 0.7796630859375,
+      "qrng_min_entropy_per_bit": 0.9159468322535631,
+      "qrng_bit_bias_p1": 0.499298095703125
+    },
+    {
+      "p2": 0.005,
+      "shor_success": 0.1669921875,
+      "grover_success": 0.63525390625,
+      "qrng_min_entropy_per_bit": 0.9159468322535631,
+      "qrng_bit_bias_p1": 0.4997406005859375
+    },
+    {
+      "p2": 0.01,
+      "shor_success": 0.1322021484375,
+      "grover_success": 0.4300537109375,
+      "qrng_min_entropy_per_bit": 0.9124450352323635,
+      "qrng_bit_bias_p1": 0.4995269775390625
+    },
+    {
+      "p2": 0.02,
+      "shor_success": 0.123779296875,
+      "grover_success": 0.2088623046875,
+      "qrng_min_entropy_per_bit": 0.9268796874098555,
+      "qrng_bit_bias_p1": 0.500762939453125
+    },
+    {
+      "p2": 0.03,
+      "shor_success": 0.12548828125,
+      "grover_success": 0.120361328125,
+      "qrng_min_entropy_per_bit": 0.923161269485599,
+      "qrng_bit_bias_p1": 0.5003204345703125
+    },
+    {
+      "p2": 0.05,
+      "shor_success": 0.1278076171875,
+      "grover_success": 0.0728759765625,
+      "qrng_min_entropy_per_bit": 0.9345547554928734,
+      "qrng_bit_bias_p1": 0.5011749267578125
+    }
+  ],
+  "qrng": {
+    "ideal": {
+      "min_entropy_bits_per_byte": 7.299560281858908,
+      "shannon_entropy_bits_per_byte": 7.976156758717757,
+      "bit_bias_p1": 0.4975738525390625,
+      "chi2_255dof": 272.25
+    },
+    "noisy": {
+      "min_entropy_bits_per_byte": 7.299560281858908,
+      "shannon_entropy_bits_per_byte": 7.97842569267925,
+      "bit_bias_p1": 0.4995269775390625,
+      "chi2_255dof": 245.125
+    },
+    "asym": {
+      "min_entropy_bits_per_byte": 7.045803689613125,
+      "shannon_entropy_bits_per_byte": 7.969953816870557,
+      "bit_bias_p1": 0.4828033447265625,
+      "chi2_255dof": 342.75
+    }
+  }
+}

@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     # --- Server ---
     server_host: str = "0.0.0.0"
     server_port: int = 8000
+    demo_mode: bool = False  # enables POST /demo/reset-replay-store for rehearsals
 
     # --- Replay detector store ---
     replay_hash_window_seconds: int = 86400
